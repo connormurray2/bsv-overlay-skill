@@ -1524,23 +1524,25 @@ async function cmdPoll() {
         }
 
         // Parse the payment transaction from the BEEF
-        let paymentTx;
-        let beef;
+        // Moneo's buildDirectPayment sends AtomicBEEF (not regular BEEF)
+        // AtomicBEEF and regular BEEF have different binary formats
+        let paymentTx = null;
+        let isAtomicBeef = false;
+
+        // Try AtomicBEEF first (what buildDirectPayment produces)
         try {
-          // Try AtomicBEEF first (what buildDirectPayment produces)
           paymentTx = Transaction.fromAtomicBEEF(Array.from(beefBytes));
-          // Also parse as Beef for internalization
-          beef = Beef.fromBinary(Array.from(beefBytes));
-        } catch {
+          isAtomicBeef = true;
+        } catch {}
+
+        // Try regular BEEF if AtomicBEEF failed
+        if (!paymentTx) {
           try {
-            beef = Beef.fromBinary(Array.from(beefBytes));
-            // Get the newest tx in the beef (the payment tx)
-            const txs = beef.txs || [];
+            const beefObj = Beef.fromBinary(Array.from(beefBytes));
+            const txs = beefObj.txs || [];
             const newest = txs.find(t => t.tx) || txs[txs.length - 1];
             paymentTx = newest?.tx || null;
-          } catch {
-            paymentTx = null;
-          }
+          } catch {}
         }
 
         if (!paymentTx) {
@@ -1622,12 +1624,21 @@ async function cmdPoll() {
           description: `Payment for tell-joke from ${msg.from.slice(0, 12)}...`,
         };
 
-        // Attempt 1: use the BEEF as provided by sender
+        // Attempt 1: use the BEEF bytes directly from sender
+        // If it's already AtomicBEEF, pass as-is. Otherwise try to convert.
         try {
           const wallet = await BSVAgentWallet.load({ network: NETWORK, storageDir: WALLET_DIR });
-          const atomicBeefBytes = beef.toBinaryAtomic(paymentTxid);
+          let atomicBytes;
+          if (isAtomicBeef) {
+            // Already AtomicBEEF format — use directly
+            atomicBytes = Array.from(beefBytes);
+          } else {
+            // Regular BEEF — convert to AtomicBEEF
+            const beefObj = Beef.fromBinary(Array.from(beefBytes));
+            atomicBytes = beefObj.toBinaryAtomic(paymentTxid);
+          }
           await wallet._setup.wallet.storage.internalizeAction({
-            tx: atomicBeefBytes,
+            tx: atomicBytes,
             ...internalizeArgs,
           });
           await wallet.destroy();
@@ -1648,10 +1659,12 @@ async function cmdPoll() {
             for (let depth = 0; depth < 10; depth++) {
               const srcTxid = curTx.inputs[0].sourceTXID;
               const srcHexResp = await fetch(`${wocBase}/tx/${srcTxid}/hex`);
+              if (!srcHexResp.ok) throw new Error(`WoC tx hex ${srcTxid.slice(0,12)}: ${srcHexResp.status}`);
               const srcHex = await srcHexResp.text();
               const srcTx = Transaction.fromHex(srcHex);
 
               const srcInfoResp = await fetch(`${wocBase}/tx/${srcTxid}`);
+              if (!srcInfoResp.ok) throw new Error(`WoC tx info ${srcTxid.slice(0,12)}: ${srcInfoResp.status}`);
               const srcInfo = await srcInfoResp.json();
 
               if (srcInfo.confirmations > 0 && srcInfo.blockheight) {
