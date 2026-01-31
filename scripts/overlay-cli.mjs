@@ -1783,31 +1783,79 @@ async function performCodeReview(input) {
     // Post the review as a comment on the GitHub PR
     try {
       const { execSync: exec2 } = await import('child_process');
-      const findingsText = review.findings.length > 0
-        ? review.findings.map(f => `- **${f.severity}** \`${f.file}\`: ${f.detail}`).join('\n')
-        : '_No issues found._';
+      // Group findings by severity
+      const bySeverity = { critical: [], high: [], warning: [], info: [] };
+      for (const f of review.findings) {
+        (bySeverity[f.severity] || bySeverity.info).push(f);
+      }
+
+      let findingsText = '';
+      if (review.findings.length === 0) {
+        findingsText = '_No issues found._';
+      } else {
+        const sections = [];
+        if (bySeverity.critical.length > 0) {
+          sections.push('#### 🔴 Critical');
+          sections.push(...bySeverity.critical.map(f => `- \`${f.file}${f.line ? ':' + f.line : ''}\` — ${f.detail}`));
+          sections.push('');
+        }
+        if (bySeverity.high.length > 0) {
+          sections.push('#### 🟠 High');
+          sections.push(...bySeverity.high.map(f => `- \`${f.file}${f.line ? ':' + f.line : ''}\` — ${f.detail}`));
+          sections.push('');
+        }
+        if (bySeverity.warning.length > 0) {
+          sections.push('#### 🟡 Warnings');
+          sections.push(...bySeverity.warning.map(f => `- \`${f.file}${f.line ? ':' + f.line : ''}\` — ${f.detail}`));
+          sections.push('');
+        }
+        if (bySeverity.info.length > 0) {
+          sections.push('#### ℹ️ Info');
+          sections.push(...bySeverity.info.map(f => `- \`${f.file}${f.line ? ':' + f.line : ''}\` — ${f.detail}`));
+          sections.push('');
+        }
+        findingsText = sections.join('\n');
+      }
+
+      const suggestionsText = review.suggestions.length > 0
+        ? '### Suggestions\n' + review.suggestions.map(s => `- ${s}`).join('\n')
+        : '';
+
+      const summaryLine = review.findingsSummary
+        ? `🔴 ${review.findingsSummary.critical} critical · 🟠 ${review.findingsSummary.high} high · 🟡 ${review.findingsSummary.warning} warnings · ℹ️ ${review.findingsSummary.info} info`
+        : '';
 
       const commentBody = [
         `## 🦉 Automated Code Review`,
         ``,
-        `**Summary:** ${review.summary}`,
-        `**Files reviewed:** ${review.filesReviewed} | **Lines changed:** ${review.linesChanged}`,
+        `| | |`,
+        `|---|---|`,
+        `| **PR** | ${review.summary} |`,
+        `| **Author** | @${review.author} |`,
+        `| **Files** | ${review.filesReviewed} |`,
+        `| **Changes** | ${review.linesChanged} |`,
+        `| **Findings** | ${summaryLine} |`,
         ``,
-        `### Findings (${review.findings.length})`,
+        `### Findings`,
+        ``,
         findingsText,
-        ``,
+        suggestionsText,
         `### Overall Assessment`,
+        ``,
         review.overallAssessment,
         ``,
         `---`,
-        `_Review performed by [BSV Overlay Skill](https://github.com/galt-tr/bsv-overlay-skill) • Paid via BSV micropayment_`,
+        `_Reviewed by [BSV Overlay Skill](https://github.com/galt-tr/bsv-overlay-skill) · Paid via BSV micropayment (50 sats)_`,
       ].join('\n');
 
-      // Post as a PR review comment (not approval — let humans decide)
+      // Write comment to temp file to avoid shell escaping issues
+      const tmpFile = path.join(os.tmpdir(), `cr-${Date.now()}.md`);
+      fs.writeFileSync(tmpFile, commentBody, 'utf-8');
       exec2(
-        `gh pr comment ${prNumber} --repo ${owner}/${repo} --body ${JSON.stringify(commentBody)}`,
+        `gh pr comment ${prNumber} --repo ${owner}/${repo} --body-file ${tmpFile}`,
         { encoding: 'utf-8', timeout: 15000 },
       );
+      try { fs.unlinkSync(tmpFile); } catch {} // cleanup
       review.githubCommentPosted = true;
     } catch (e) {
       review.githubCommentPosted = false;
@@ -1828,43 +1876,105 @@ function analyzePrReview(prInfo, diff) {
   const findings = [];
   const diffLines = diff.split('\n');
   let currentFile = '';
+  let currentHunk = '';
   let addedLines = 0;
   let removedLines = 0;
+  let lineNum = 0;
+
+  // Per-file tracking
+  const fileStats = {};
+  const addedBlocks = {}; // file -> array of consecutive added lines
 
   for (const line of diffLines) {
     if (line.startsWith('diff --git')) {
       currentFile = line.split(' b/')[1] || '';
+      if (!fileStats[currentFile]) fileStats[currentFile] = { added: 0, removed: 0, functions: [], imports: [] };
+    } else if (line.startsWith('@@')) {
+      currentHunk = line;
+      const match = line.match(/@@ .* \+(\d+)/);
+      lineNum = match ? parseInt(match[1]) - 1 : 0;
     } else if (line.startsWith('+') && !line.startsWith('+++')) {
       addedLines++;
-      if (line.includes('console.log'))
-        findings.push({ severity: 'warning', file: currentFile, detail: 'console.log detected — remove debug logging' });
-      if (line.includes('TODO') || line.includes('FIXME'))
-        findings.push({ severity: 'info', file: currentFile, detail: `TODO/FIXME comment: ${line.trim().slice(0, 80)}` });
-      if (line.includes('password') || line.includes('secret') || line.includes('api_key'))
-        findings.push({ severity: 'critical', file: currentFile, detail: 'Potential secret/credential in code' });
-      if (line.match(/catch\s*\(\s*\w*\s*\)\s*\{\s*\}/))
-        findings.push({ severity: 'warning', file: currentFile, detail: 'Empty catch block — errors silently swallowed' });
-      if (line.includes('eval('))
-        findings.push({ severity: 'critical', file: currentFile, detail: 'eval() usage detected — potential security risk' });
+      lineNum++;
+      if (fileStats[currentFile]) fileStats[currentFile].added++;
+      const trimmed = line.slice(1).trim();
+
+      // ── Security checks ──
+      if (trimmed.includes('eval('))
+        findings.push({ severity: 'critical', file: currentFile, line: lineNum, detail: '`eval()` usage — potential code injection risk' });
+      if (trimmed.match(/\bexecSync\b|\bexec\b/) && trimmed.match(/\$\{|\+\s*\w/))
+        findings.push({ severity: 'critical', file: currentFile, line: lineNum, detail: 'Shell command with string interpolation — injection risk' });
+      if (trimmed.match(/password|secret|api_key|apikey|private_key|token/i) && !trimmed.match(/\/\/|^\s*\*|param|type|interface|@/))
+        findings.push({ severity: 'high', file: currentFile, line: lineNum, detail: 'Possible hardcoded secret or credential' });
+      if (trimmed.match(/https?:\/\/\d+\.\d+\.\d+\.\d+/))
+        findings.push({ severity: 'warning', file: currentFile, line: lineNum, detail: 'Hardcoded IP address — use config/env variable' });
+      if (trimmed.includes('dangerouslySetInnerHTML') || trimmed.includes('innerHTML'))
+        findings.push({ severity: 'high', file: currentFile, line: lineNum, detail: 'Direct HTML injection — XSS risk' });
+
+      // ── Error handling ──
+      if (trimmed.match(/catch\s*\([^)]*\)\s*\{\s*\}/) || trimmed.match(/catch\s*\{\s*\}/))
+        findings.push({ severity: 'warning', file: currentFile, line: lineNum, detail: 'Empty catch block — errors silently swallowed' });
+      if (trimmed.match(/catch\s*\([^)]*\)\s*\{\s*\/\//))
+        findings.push({ severity: 'info', file: currentFile, line: lineNum, detail: 'Catch block with only a comment — consider logging the error' });
+      if (trimmed.match(/\.then\(/) && !trimmed.match(/\.catch\(/))
+        findings.push({ severity: 'info', file: currentFile, line: lineNum, detail: 'Promise .then() without .catch() — unhandled rejection risk' });
+
+      // ── Code quality ──
+      if (trimmed.match(/console\.(log|debug|info)\(/))
+        findings.push({ severity: 'warning', file: currentFile, line: lineNum, detail: 'Debug logging left in — remove before merge' });
+      if (trimmed.match(/TODO|FIXME|HACK|XXX|TEMP/i))
+        findings.push({ severity: 'info', file: currentFile, line: lineNum, detail: `Marker comment: ${trimmed.slice(0, 100)}` });
+      if (trimmed.includes('var ') && !trimmed.match(/\/\/|^\s*\*/))
+        findings.push({ severity: 'info', file: currentFile, line: lineNum, detail: '`var` declaration — prefer `let` or `const`' });
       if (line.length > 200)
-        findings.push({ severity: 'info', file: currentFile, detail: `Long line (${line.length} chars) — consider breaking up` });
-      if (line.includes('var '))
-        findings.push({ severity: 'info', file: currentFile, detail: 'Use let/const instead of var' });
-      if (line.match(/===?\s*null\b/) && !line.match(/!==?\s*null\b/))
-        findings.push({ severity: 'info', file: currentFile, detail: 'Null check — consider optional chaining (?.)' });
+        findings.push({ severity: 'info', file: currentFile, line: lineNum, detail: `Line too long (${line.length} chars)` });
+      if (trimmed.match(/==\s/) && !trimmed.match(/===/) && !trimmed.match(/!==/) && !trimmed.match(/\/\//))
+        findings.push({ severity: 'warning', file: currentFile, line: lineNum, detail: 'Loose equality (`==`) — use strict equality (`===`)' });
+      if (trimmed.match(/\bany\b/) && currentFile.match(/\.ts$/))
+        findings.push({ severity: 'info', file: currentFile, line: lineNum, detail: '`any` type — consider a more specific type' });
+
+      // ── Reliability ──
+      if (trimmed.match(/fetch\(/) && !trimmed.match(/timeout|signal|AbortController/))
+        findings.push({ severity: 'warning', file: currentFile, line: lineNum, detail: 'fetch() without timeout — could hang indefinitely' });
+      if (trimmed.match(/JSON\.parse\(/) && !currentHunk.includes('try'))
+        findings.push({ severity: 'warning', file: currentFile, line: lineNum, detail: 'JSON.parse without try/catch — will throw on invalid input' });
+      if (trimmed.match(/fs\.(readFileSync|writeFileSync)/) && !currentHunk.includes('try'))
+        findings.push({ severity: 'info', file: currentFile, line: lineNum, detail: 'Sync file I/O without error handling' });
+
+      // ── Architecture ──
+      if (trimmed.match(/function\s+\w+/) || trimmed.match(/(const|let)\s+\w+\s*=\s*(async\s+)?\(/)) {
+        const fname = trimmed.match(/function\s+(\w+)/)?.[1] || trimmed.match(/(const|let)\s+(\w+)/)?.[2];
+        if (fname && fileStats[currentFile]) fileStats[currentFile].functions.push(fname);
+      }
+      if (trimmed.match(/^import\s/) || trimmed.match(/require\(/)) {
+        if (fileStats[currentFile]) fileStats[currentFile].imports.push(trimmed.slice(0, 80));
+      }
     } else if (line.startsWith('-') && !line.startsWith('---')) {
       removedLines++;
+      lineNum++;
+    } else {
+      lineNum++;
     }
   }
 
-  // Deduplicate
-  const seen = new Set();
-  const uniqueFindings = findings.filter(f => {
-    const key = f.file + '|' + f.detail;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+  // ── Structural analysis ──
+  const suggestions = [];
+
+  // Large PR
+  if (addedLines > 500)
+    suggestions.push(`Large PR (+${addedLines} lines) — consider splitting into smaller, focused PRs for easier review`);
+  if (files.length > 10)
+    suggestions.push(`${files.length} files changed — verify all changes are related to the PR scope`);
+
+  // Single file dominance
+  const sortedFiles = Object.entries(fileStats).sort((a, b) => b[1].added - a[1].added);
+  if (sortedFiles.length > 1 && sortedFiles[0][1].added > addedLines * 0.8)
+    suggestions.push(`${sortedFiles[0][0]} has ${sortedFiles[0][1].added}/${addedLines} additions — consider if this file is getting too large`);
+
+  // Many new functions
+  const totalNewFunctions = Object.values(fileStats).reduce((sum, s) => sum + s.functions.length, 0);
+  if (totalNewFunctions > 10)
+    suggestions.push(`${totalNewFunctions} new functions added — ensure they're well-tested and documented`);
 
   // File type analysis
   const fileTypes = {};
@@ -1873,15 +1983,42 @@ function analyzePrReview(prInfo, diff) {
     fileTypes[ext] = (fileTypes[ext] || 0) + 1;
   }
 
-  const suggestions = [];
-  if (uniqueFindings.some(f => f.severity === 'critical'))
-    suggestions.push('Address critical findings (secrets, eval) before merging');
-  if (uniqueFindings.filter(f => f.detail.includes('console.log')).length > 2)
-    suggestions.push('Remove debug console.log statements');
-  if (addedLines > 500)
-    suggestions.push('Large PR — consider breaking into smaller, focused PRs');
-  if (files.length > 10)
-    suggestions.push('Many files changed — ensure each change is related');
+  // Test file check
+  const hasTests = files.some(f => f.path?.match(/test|spec|__tests__/i));
+  if (addedLines > 50 && !hasTests)
+    suggestions.push('No test files included — consider adding tests for new functionality');
+
+  // Deduplicate findings
+  const seen = new Set();
+  const uniqueFindings = findings.filter(f => {
+    const key = f.file + '|' + f.detail;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  // Build assessment
+  const criticalCount = uniqueFindings.filter(f => f.severity === 'critical').length;
+  const highCount = uniqueFindings.filter(f => f.severity === 'high').length;
+  const warningCount = uniqueFindings.filter(f => f.severity === 'warning').length;
+  const infoCount = uniqueFindings.filter(f => f.severity === 'info').length;
+
+  let overallAssessment;
+  if (criticalCount > 0)
+    overallAssessment = `🔴 ${criticalCount} critical issue(s) found — must be addressed before merging`;
+  else if (highCount > 0)
+    overallAssessment = `🟠 ${highCount} high-severity issue(s) — strongly recommend fixing before merge`;
+  else if (warningCount > 3)
+    overallAssessment = `🟡 ${warningCount} warnings — review and address where appropriate`;
+  else if (warningCount > 0)
+    overallAssessment = `🟢 Minor warnings only (${warningCount}) — looks good overall`;
+  else if (infoCount > 0)
+    overallAssessment = `✅ Clean — only informational notes (${infoCount})`;
+  else
+    overallAssessment = `✅ No issues found — LGTM`;
+
+  if (suggestions.length > 0)
+    overallAssessment += '\n\n**Suggestions:**\n' + suggestions.map(s => `- ${s}`).join('\n');
 
   return {
     type: 'code-review',
@@ -1890,13 +2027,10 @@ function analyzePrReview(prInfo, diff) {
     filesReviewed: files.length,
     linesChanged: `+${prInfo.additions || addedLines} / -${prInfo.deletions || removedLines}`,
     fileTypes,
-    findings: uniqueFindings.slice(0, 20),
+    findings: uniqueFindings.slice(0, 30),
+    findingsSummary: { critical: criticalCount, high: highCount, warning: warningCount, info: infoCount },
     suggestions,
-    overallAssessment: uniqueFindings.some(f => f.severity === 'critical')
-      ? 'Issues found — review critical findings before merging'
-      : uniqueFindings.length > 5
-        ? 'Several items to address — mostly minor improvements'
-        : 'Looks clean — minor suggestions only',
+    overallAssessment,
   };
 }
 
