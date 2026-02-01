@@ -1353,14 +1353,15 @@ function initMneeSdk(requireApiKey = true) {
       environment: MNEE_ENVIRONMENT,
     };
     
-    // Only add API key if provided or required
-    if (MNEE_API_KEY) {
+    // Only add API key if required AND provided
+    if (requireApiKey && MNEE_API_KEY) {
       config.apiKey = MNEE_API_KEY;
-    } else if (requireApiKey) {
-      // Some operations like balance/transfer need API key
+    } else if (requireApiKey && !MNEE_API_KEY) {
+      // API key required but not provided
       console.error(`[MNEE] API key required for this operation. Set MNEE_API_KEY environment variable.`);
       return null;
     }
+    // When requireApiKey=false, don't add API key even if available (for read-only ops)
     
     return new Mnee(config);
   } catch (err) {
@@ -1523,7 +1524,7 @@ async function cmdMneeBalance() {
     return fail('MNEE wallet not initialized. Run: mnee-setup');
   }
 
-  const mnee = initMneeSdk();
+  const mnee = initMneeSdk(false); // API key not required for balance queries
   if (!mnee) {
     return fail('Failed to initialize MNEE SDK.');
   }
@@ -1549,8 +1550,9 @@ async function cmdMneeBalance() {
             atomicBalance: atomicAmount,
           });
         }
-      } catch {
-        // Address might not exist on chain yet
+      } catch (err) {
+        // Address might not exist on chain yet, or API error
+        console.error(`[MNEE] Balance check failed for ${addr.address}: ${err.message || err}`);
       }
     }
 
