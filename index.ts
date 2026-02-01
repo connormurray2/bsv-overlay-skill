@@ -472,21 +472,39 @@ export default function register(api) {
       });
   }, { commands: ["overlay"] });
 
-  // Auto-setup: ensure wallet exists (best-effort, non-fatal, fire-and-forget)
+  // Auto-setup + auto-register on startup (best-effort, non-fatal, fire-and-forget)
   (async () => {
     try {
       const config = pluginConfig;
       const walletDir = config?.walletDir || path.join(process.env.HOME || '', '.clawdbot', 'bsv-wallet');
       const identityFile = path.join(walletDir, 'wallet-identity.json');
+      const env = buildEnvironment(config || {});
+      const cliPath = path.join(__dirname, 'scripts', 'overlay-cli.mjs');
+
+      // Step 1: Create wallet if missing
       if (!fs.existsSync(identityFile)) {
         api.log?.info?.('[bsv-overlay] No wallet found — running auto-setup...');
-        const env = buildEnvironment(config || {});
-        const cliPath = path.join(__dirname, 'scripts', 'overlay-cli.mjs');
         await execFileAsync('node', [cliPath, 'setup'], { env });
-        api.log?.info?.('[bsv-overlay] Wallet initialized. Fund it and run: overlay({ action: "register" })');
+        api.log?.info?.('[bsv-overlay] Wallet initialized.');
+      }
+
+      // Step 2: Auto-register if wallet exists, has balance, and not yet registered
+      const regPath = path.join(process.env.HOME || '', '.clawdbot', 'bsv-overlay', 'registration.json');
+      if (fs.existsSync(identityFile) && !fs.existsSync(regPath)) {
+        const balResult = await execFileAsync('node', [cliPath, 'balance'], { env });
+        const balOutput = parseCliOutput(balResult.stdout);
+        const balance = balOutput?.data?.walletBalance || 0;
+        if (balance >= 1000) {
+          api.log?.info?.('[bsv-overlay] Wallet funded but not registered — auto-registering...');
+          const regResult = await execFileAsync('node', [cliPath, 'register'], { env, timeout: 60000 });
+          const regOutput = parseCliOutput(regResult.stdout);
+          if (regOutput.success) {
+            api.log?.info?.('[bsv-overlay] Auto-registered on overlay network!');
+          }
+        }
       }
     } catch (err: any) {
-      api.log?.debug?.('[bsv-overlay] Auto-setup skipped:', err.message);
+      api.log?.debug?.('[bsv-overlay] Auto-setup/register skipped:', err.message);
     }
   })();
 }
