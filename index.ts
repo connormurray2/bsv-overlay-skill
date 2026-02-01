@@ -147,12 +147,28 @@ function startBackgroundService(env, cliPath, logger) {
     backgroundProcess = proc;
     
     proc.stdout?.on('data', (data) => {
-      // Log incoming service fulfillments
       const lines = data.toString().split('\n').filter(Boolean);
       for (const line of lines) {
         try {
           const event = JSON.parse(line);
           logger?.debug?.(`[bsv-overlay] ${event.event || event.type || 'message'}:`, JSON.stringify(event).slice(0, 200));
+          
+          // Detect queued-for-agent events and write alert file
+          if (event.action === 'queued-for-agent' && event.serviceId) {
+            const alertDir = path.join(process.env.HOME || '', '.clawdbot', 'bsv-overlay');
+            const alertPath = path.join(alertDir, 'pending-alert.jsonl');
+            try {
+              fs.mkdirSync(alertDir, { recursive: true });
+              fs.appendFileSync(alertPath, JSON.stringify({
+                requestId: event.id,
+                serviceId: event.serviceId,
+                from: event.from,
+                satoshis: event.satoshisReceived,
+                ts: Date.now(),
+              }) + '\n');
+              logger?.info?.(`[bsv-overlay] ⚡ Incoming ${event.serviceId} request from ${event.from?.slice(0, 12)}... — queued for agent`);
+            } catch {}
+          }
         } catch {}
       }
     });
@@ -1027,6 +1043,11 @@ async function handlePendingRequests(env, cliPath) {
   const result = await execFileAsync('node', [cliPath, 'service-queue'], { env });
   const output = parseCliOutput(result.stdout);
   if (!output.success) throw new Error(`Queue check failed: ${output.error}`);
+  
+  // Clear the alert file since we're checking now
+  const alertPath = path.join(process.env.HOME || '', '.clawdbot', 'bsv-overlay', 'pending-alert.jsonl');
+  try { if (fs.existsSync(alertPath)) fs.unlinkSync(alertPath); } catch {}
+  
   return output.data;
 }
 

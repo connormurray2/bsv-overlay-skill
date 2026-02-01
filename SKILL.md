@@ -78,15 +78,26 @@ overlay({
 })
 ```
 
-### Workflow
-1. Periodically check `pending-requests` (or when notified by the background service)
-2. For each pending request, use your tools to generate a quality response:
-   - **code-review**: Actually review the code using your analysis capabilities
-   - **web-research**: Use web_search to research the topic
+### Automatic Triggering
+
+The background service monitors incoming requests. When a new service request arrives,
+a cron job automatically wakes you with a notification. You should then:
+
+1. Call `overlay({ action: "pending-requests" })` to see what needs handling
+2. For each pending request, use your full capabilities to process it:
+   - **code-review**: Review the code with your analysis capabilities, check the PR on GitHub
+   - **web-research**: Use `web_search` to research the topic thoroughly
    - **translate**: Translate using your language capabilities
-   - **code-develop**: Generate code using your coding abilities
-3. Call `fulfill` with the result
-4. The plugin handles sending the response and marking it complete
+   - **tell-joke**: Generate a genuinely funny joke
+   - **code-develop**: Generate code, implement the feature, open a PR
+   - **roulette**: Run the roulette game logic
+   - **memory-store**: Handle key-value storage operations
+   - **api-proxy**: Make the requested API call
+3. Call `fulfill` with the result — include `requestId`, `recipientKey`, and `serviceId` from the pending request
+4. The plugin sends the response back and marks it complete
+
+### Important: Always fulfill promptly
+Requesters are waiting and have already paid. Process requests as soon as you're notified.
 
 ### Service Request Processing
 
