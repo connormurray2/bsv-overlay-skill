@@ -42,6 +42,14 @@ function loadDailySpending(walletDir: string): DailySpending {
   return { date: today, totalSats: 0, transactions: [] };
 }
 
+function writeActivityEvent(event) {
+  const alertDir = path.join(process.env.HOME || '', '.clawdbot', 'bsv-overlay');
+  try {
+    fs.mkdirSync(alertDir, { recursive: true });
+    fs.appendFileSync(path.join(alertDir, 'activity-feed.jsonl'), JSON.stringify({ ...event, ts: Date.now() }) + '\n');
+  } catch {}
+}
+
 function recordSpend(walletDir: string, sats: number, service: string, provider: string) {
   const spending = loadDailySpending(walletDir);
   spending.totalSats += sats;
@@ -132,6 +140,33 @@ function stopAutoImport() {
   }
 }
 
+// Categorize WebSocket events into notification types
+function categorizeEvent(event) {
+  const base = { ts: Date.now(), from: event.from?.slice(0, 16), fullFrom: event.from };
+  
+  // 💰 Incoming payment — someone paid us for a service
+  if (event.action === 'queued-for-agent' && event.satoshisReceived) {
+    return { ...base, type: 'incoming_payment', emoji: '💰', serviceId: event.serviceId, sats: event.satoshisReceived, requestId: event.id, message: `Received ${event.satoshisReceived} sats for ${event.serviceId}` };
+  }
+  if (event.action === 'fulfilled' && event.satoshisReceived) {
+    return { ...base, type: 'incoming_payment', emoji: '💰', serviceId: event.serviceId, sats: event.satoshisReceived, message: `Received ${event.satoshisReceived} sats for ${event.serviceId} (auto-fulfilled)` };
+  }
+  
+  // 📬 Response received — a service we requested came back
+  if (event.type === 'service-response' && event.action === 'received') {
+    const payload = event.payload || {};
+    return { ...base, type: 'response_received', emoji: '📬', serviceId: payload.serviceId, status: payload.status, message: `Response received for ${payload.serviceId}: ${payload.status}` };
+  }
+  
+  // ❌ Request rejected
+  if (event.action === 'rejected' && event.serviceId) {
+    return { ...base, type: 'request_rejected', emoji: '❌', serviceId: event.serviceId, reason: event.reason, message: `Rejected ${event.serviceId} request: ${event.reason}` };
+  }
+  
+  // Skip pings/pongs and other noise
+  return null;
+}
+
 function startBackgroundService(env, cliPath, logger) {
   if (backgroundProcess) return;
   serviceRunning = true;
@@ -153,22 +188,28 @@ function startBackgroundService(env, cliPath, logger) {
           const event = JSON.parse(line);
           logger?.debug?.(`[bsv-overlay] ${event.event || event.type || 'message'}:`, JSON.stringify(event).slice(0, 200));
           
-          // Detect queued-for-agent events and wake the agent immediately
+          const alertDir = path.join(process.env.HOME || '', '.clawdbot', 'bsv-overlay');
+          fs.mkdirSync(alertDir, { recursive: true });
+          
+          // Detect queued-for-agent events — write fulfillment alert
           if (event.action === 'queued-for-agent' && event.serviceId) {
-            logger?.info?.(`[bsv-overlay] ⚡ Incoming ${event.serviceId} request from ${event.from?.slice(0, 12)}... — waking agent`);
-            
-            // Write alert file for the cron-based fulfillment checker to pick up
-            const alertDir = path.join(process.env.HOME || '', '.clawdbot', 'bsv-overlay');
-            const alertPath = path.join(alertDir, 'pending-alert.jsonl');
+            logger?.info?.(`[bsv-overlay] ⚡ Incoming ${event.serviceId} request from ${event.from?.slice(0, 12)}...`);
             try {
-              fs.mkdirSync(alertDir, { recursive: true });
-              fs.appendFileSync(alertPath, JSON.stringify({
+              fs.appendFileSync(path.join(alertDir, 'pending-alert.jsonl'), JSON.stringify({
                 requestId: event.id,
                 serviceId: event.serviceId,
                 from: event.from,
                 satoshis: event.satoshisReceived,
                 ts: Date.now(),
               }) + '\n');
+            } catch {}
+          }
+          
+          // Write payment/activity notifications for ALL significant events
+          const notifEvent = categorizeEvent(event);
+          if (notifEvent) {
+            try {
+              fs.appendFileSync(path.join(alertDir, 'activity-feed.jsonl'), JSON.stringify(notifEvent) + '\n');
             } catch {}
           }
         } catch {}
@@ -601,6 +642,9 @@ async function executeOverlayAction(params, config, api) {
     case "pending-requests":
       return await handlePendingRequests(env, cliPath);
     
+    case "activity":
+      return handleActivity();
+    
     case "fulfill":
       return await handleFulfill(params, env, cliPath);
     
@@ -698,8 +742,9 @@ async function handleServiceRequest(params, env, cliPath, config, api) {
         for (const msg of messages) {
           if (msg.type === 'service-response' && msg.from === bestProvider.identityKey) {
             api.logger.info(`Received response from ${bestProvider.agentName}`);
-            // Record the spending
             recordSpend(walletDir, price, service, bestProvider.agentName);
+            writeActivityEvent({ type: 'outgoing_payment', emoji: '💸', sats: price, service, provider: bestProvider.agentName, message: `Paid ${price} sats to ${bestProvider.agentName} for ${service}` });
+            writeActivityEvent({ type: 'response_received', emoji: '📬', service, provider: bestProvider.agentName, status: msg.payload?.status, message: `${service} response received from ${bestProvider.agentName}` });
             return {
               provider: bestProvider.agentName,
               cost: price,
@@ -715,8 +760,8 @@ async function handleServiceRequest(params, env, cliPath, config, api) {
   }
   
   // Don't throw — the response may still arrive via WebSocket
-  // Record the spend since payment was already sent
   recordSpend(walletDir, price, service, bestProvider.agentName);
+  writeActivityEvent({ type: 'outgoing_payment', emoji: '💸', sats: price, service, provider: bestProvider.agentName, message: `Paid ${price} sats to ${bestProvider.agentName} for ${service} (awaiting response)` });
   return {
     provider: bestProvider.agentName,
     cost: price,
@@ -812,6 +857,7 @@ async function handleDirectPay(params, env, cliPath, config) {
 
   // Record the spending
   recordSpend(walletDir, sats, 'direct-payment', identityKey);
+  writeActivityEvent({ type: 'outgoing_payment', emoji: '💸', sats, service: 'direct-payment', provider: identityKey?.slice(0, 16), message: `Direct payment: ${sats} sats sent` });
   
   return output.data;
 }
@@ -1080,6 +1126,19 @@ async function handlePendingRequests(env, cliPath) {
   return output.data;
 }
 
+function handleActivity() {
+  const feedPath = path.join(process.env.HOME || '', '.clawdbot', 'bsv-overlay', 'activity-feed.jsonl');
+  if (!fs.existsSync(feedPath)) return { events: [], count: 0 };
+  
+  const lines = fs.readFileSync(feedPath, 'utf-8').trim().split('\n').filter(Boolean);
+  const events = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  
+  // Clear the feed after reading
+  fs.writeFileSync(feedPath, '');
+  
+  return { events, count: events.length };
+}
+
 async function handleFulfill(params, env, cliPath) {
   const { requestId, recipientKey, serviceId, result } = params;
   if (!requestId || !recipientKey || !serviceId || !result) {
@@ -1091,6 +1150,9 @@ async function handleFulfill(params, env, cliPath) {
   ], { env });
   const output = parseCliOutput(cliResult.stdout);
   if (!output.success) throw new Error(`Fulfill failed: ${output.error}`);
+  
+  writeActivityEvent({ type: 'service_fulfilled', emoji: '✅', serviceId, recipientKey: recipientKey?.slice(0, 16), message: `Fulfilled ${serviceId} request — response sent` });
+  
   return output.data;
 }
 
