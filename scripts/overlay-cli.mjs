@@ -300,11 +300,16 @@ async function buildRealOverlayTransaction(payload, topic) {
 
   if (utxos.length > 0) {
     // === REAL FUNDED TRANSACTION ===
-    return await buildRealFundedTx(payload, topic, utxos[0], privKey, pubKey, hash160, walletAddress, wocBase);
+    try {
+      return await buildRealFundedTx(payload, topic, utxos[0], privKey, pubKey, hash160, walletAddress, wocBase);
+    } catch (realErr) {
+      // WoC UTXO may be stale (already spent in overlay but not on-chain)
+      // Fall through to wallet createAction
+    }
   }
 
   // === FALLBACK: Try wallet's internal createAction ===
-  // This works if the wallet DB has spendable outputs
+  // This works if the wallet DB has spendable outputs (including unconfirmed change)
   try {
     return await buildWalletCreateActionTx(payload, topic, identity);
   } catch (walletErr) {
@@ -326,16 +331,44 @@ async function buildRealFundedTx(payload, topic, utxo, privKey, pubKey, hash160,
   const txInfo = await txInfoResp.json();
   const blockHeight = txInfo.blockheight;
 
-  if (blockHeight && txInfo.confirmations > 0) {
-    const proofResp = await wocFetch(`/tx/${utxo.tx_hash}/proof/tsc`);
-    if (proofResp.ok) {
-      const proofData = await proofResp.json();
-      if (Array.isArray(proofData) && proofData.length > 0) {
-        const proof = proofData[0];
-        const mpPath = buildMerklePathFromTSC(utxo.tx_hash, proof.index, proof.nodes, blockHeight);
-        sourceTx.merklePath = mpPath;
+  // Walk the source chain back to a confirmed tx with merkle proof.
+  // Each unconfirmed tx needs its sourceTransaction linked for BEEF building.
+  const txChain = []; // will contain [sourceTx, ..., provenAncestor] newest-first
+  let curTx = sourceTx;
+  let curTxid = utxo.tx_hash;
+  let curHeight = blockHeight;
+  let curConf = txInfo.confirmations;
+
+  for (let depth = 0; depth < 10; depth++) {
+    if (curHeight && curConf > 0) {
+      // Confirmed tx — attach merkle proof
+      const proofResp = await wocFetch(`/tx/${curTxid}/proof/tsc`);
+      if (proofResp.ok) {
+        const proofData = await proofResp.json();
+        if (Array.isArray(proofData) && proofData.length > 0) {
+          const proof = proofData[0];
+          curTx.merklePath = buildMerklePathFromTSC(curTxid, proof.index, proof.nodes, curHeight);
+        }
       }
+      txChain.push(curTx);
+      break; // Found a proven tx, stop walking
     }
+    // Unconfirmed — walk to its first input's source
+    txChain.push(curTx);
+    const parentTxid = curTx.inputs[0]?.sourceTXID;
+    if (!parentTxid) break;
+    const parentHexResp = await wocFetch(`/tx/${parentTxid}/hex`);
+    if (!parentHexResp.ok) break;
+    const parentTx = Transaction.fromHex(await parentHexResp.text());
+    // Link the child's input to the parent Transaction object
+    curTx.inputs[0].sourceTransaction = parentTx;
+    const parentInfoResp = await wocFetch(`/tx/${parentTxid}`);
+    if (!parentInfoResp.ok) break;
+    const parentInfo = await parentInfoResp.json();
+    curTx = parentTx;
+    curTxid = parentTxid;
+    curHeight = parentInfo.blockheight;
+    curConf = parentInfo.confirmations;
   }
 
   // Build the OP_RETURN transaction
@@ -366,9 +399,9 @@ async function buildRealFundedTx(payload, topic, utxo, privKey, pubKey, hash160,
   await tx.sign();
   const txid = tx.id('hex');
 
-  // Build BEEF using Beef class (preserves merkle paths, unlike tx.toBEEF())
+  // Build BEEF — mergeTransaction auto-follows sourceTransaction links
+  const srcTxRef = tx.inputs[0]?.sourceTransaction;
   const beefObj = new Beef();
-  beefObj.mergeTransaction(sourceTx);
   beefObj.mergeTransaction(tx);
   const beef = beefObj.toBinary();
 
