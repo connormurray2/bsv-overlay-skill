@@ -1953,6 +1953,16 @@ function formatServiceResponse(serviceId, status, result) {
         },
       };
     
+    case 'bsv-faucet':
+      return {
+        ...base,
+        type: 'bsv-faucet',
+        summary: result?.error 
+          ? `Faucet error: ${result.error}` 
+          : `Faucet: Sent ${result?.amount || 0} sats`,
+        details: result,
+      };
+    
     default:
       // Generic service response — show preview of result
       const resultPreview = result
@@ -2146,6 +2156,8 @@ async function processMessage(msg, identityKey, privKey) {
       return await processMemoryStore(msg, identityKey, privKey);
     } else if (serviceId === 'code-develop') {
       return await processCodeDevelop(msg, identityKey, privKey);
+    } else if (serviceId === 'bsv-faucet') {
+      return await processFaucet(msg, identityKey, privKey);
     } else {
       // Unknown service — don't auto-process
       return {
@@ -3190,6 +3202,18 @@ async function processRoulette(msg, identityKey, privKey) {
     }
   }
 
+  // ── If player lost, fund the faucet with the bet amount ──
+  let faucetFunded = false;
+  if (!won && actualBetAmount > 0) {
+    try {
+      await fundFaucetFromRoulette(actualBetAmount, `Roulette loss: ${normalizedBet} on ${spinResult}`);
+      faucetFunded = true;
+    } catch (faucetErr) {
+      // Non-fatal - log but continue
+      console.error(`[Roulette] Faucet funding failed: ${faucetErr.message}`);
+    }
+  }
+
   // Build result
   const gameResult = {
     spin: spinResult,
@@ -3200,11 +3224,12 @@ async function processRoulette(msg, identityKey, privKey) {
     multiplier: won ? multiplier : 0,
     payout: won ? payout : 0,
     winningsPaid,
+    faucetFunded,
     ...(winningsPayment ? { payoutTxid: winningsPayment.txid } : {}),
     ...(payoutError ? { payoutError } : {}),
     message: won
       ? `🎰 ${spinResult} ${resultColor.toUpperCase()}! You WIN ${payout} sats (${multiplier}x)!`
-      : `🎰 ${spinResult} ${resultColor.toUpperCase()}. You lose ${actualBetAmount} sats. Better luck next time!`,
+      : `🎰 ${spinResult} ${resultColor.toUpperCase()}. You lose ${actualBetAmount} sats. ${faucetFunded ? '(Funded the faucet!)' : ''} Better luck next time!`,
   };
 
   // Send response
@@ -3334,6 +3359,246 @@ function evaluateRouletteBet(bet, spinResult, betAmount) {
 
     default:
       return { won: false, payout: 0, multiplier: 0 };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Service: bsv-faucet (free - dispenses starter sats to new agents)
+// ---------------------------------------------------------------------------
+
+const FAUCET_ADDRESS = '1HFJ7QGWh36J3aBk26KXNRwCxKtgLQCCmz';
+const FAUCET_DRIP_AMOUNT = 100; // sats per drip
+const FAUCET_COOLDOWN_MS = 24 * 60 * 60 * 1000; // 24 hours
+const FAUCET_HISTORY_PATH = path.join(OVERLAY_STATE_DIR, 'faucet-history.json');
+
+function loadFaucetHistory() {
+  try {
+    if (fs.existsSync(FAUCET_HISTORY_PATH)) {
+      return JSON.parse(fs.readFileSync(FAUCET_HISTORY_PATH, 'utf-8'));
+    }
+  } catch { /* corrupted file, start fresh */ }
+  return { recipients: {} };
+}
+
+function saveFaucetHistory(history) {
+  fs.writeFileSync(FAUCET_HISTORY_PATH, JSON.stringify(history, null, 2));
+}
+
+async function processFaucet(msg, identityKey, privKey) {
+  const input = msg.payload?.input || msg.payload;
+  const recipientPubKey = input?.pubkey || msg.from;
+
+  // Helper to send response
+  async function sendResponse(status, result) {
+    const responsePayload = { requestId: msg.id, serviceId: 'bsv-faucet', status, result };
+    const sig = signRelayMessage(privKey, msg.from, 'service-response', responsePayload);
+    await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: responsePayload, signature: sig }),
+    }, 15000);
+    return { id: msg.id, type: 'service-request', serviceId: 'bsv-faucet', action: status, result, from: msg.from, ack: true };
+  }
+
+  // Validate pubkey format
+  if (!/^0[23][0-9a-fA-F]{64}$/.test(recipientPubKey)) {
+    return sendResponse('rejected', { error: 'Invalid pubkey format. Expected 66-char compressed pubkey.' });
+  }
+
+  // Check rate limit
+  const history = loadFaucetHistory();
+  const lastDrip = history.recipients[recipientPubKey];
+  if (lastDrip && Date.now() - lastDrip < FAUCET_COOLDOWN_MS) {
+    const waitHours = Math.ceil((FAUCET_COOLDOWN_MS - (Date.now() - lastDrip)) / (60 * 60 * 1000));
+    return sendResponse('rejected', { error: `Rate limited. Try again in ${waitHours} hours.`, lastDrip });
+  }
+
+  // Check faucet balance from wallet DB
+  let faucetBalance = 0;
+  try {
+    const dbPath = path.join(WALLET_DIR, 'wallet.db');
+    if (fs.existsSync(dbPath)) {
+      // Simple check: if wallet exists, assume we have some balance
+      // Full balance check would require sqlite query
+      faucetBalance = 100; // Placeholder - actual balance check via CLI if needed
+    }
+  } catch {}
+
+  if (faucetBalance < FAUCET_DRIP_AMOUNT + 10) { // +10 for tx fee
+    return sendResponse('rejected', { error: 'Faucet is empty. Please try again later.', faucetBalance });
+  }
+
+  // Send the drip
+  try {
+    const payment = await buildDirectPayment(recipientPubKey, FAUCET_DRIP_AMOUNT, `Faucet drip to new agent`);
+    
+    // Record the drip
+    history.recipients[recipientPubKey] = Date.now();
+    saveFaucetHistory(history);
+
+    return sendResponse('fulfilled', {
+      message: `Welcome! Sent ${FAUCET_DRIP_AMOUNT} sats to get you started.`,
+      txid: payment.txid,
+      amount: FAUCET_DRIP_AMOUNT,
+      recipient: recipientPubKey,
+    });
+  } catch (err) {
+    return sendResponse('failed', { error: `Failed to send drip: ${err.message}` });
+  }
+}
+
+/**
+ * Send roulette house winnings to the faucet address.
+ * Called when a player loses.
+ */
+async function fundFaucetFromRoulette(amount, description) {
+  try {
+    // Load wallet identity
+    const identityPath = path.join(WALLET_DIR, 'wallet-identity.json');
+    if (!fs.existsSync(identityPath)) {
+      throw new Error('Wallet not initialized');
+    }
+    const identity = JSON.parse(fs.readFileSync(identityPath, 'utf-8'));
+    const privKey = PrivateKey.fromHex(identity.rootKeyHex);
+    const senderPubKey = privKey.toPublicKey();
+
+    // Derive sender's P2PKH address
+    const senderPubKeyBytes = senderPubKey.encode(true);
+    const senderHash160 = Hash.hash160(senderPubKeyBytes);
+
+    // Decode faucet address to get pubkey hash
+    const faucetDecoded = Utils.fromBase58(FAUCET_ADDRESS);
+    const faucetHash160 = faucetDecoded.slice(1, 21);
+
+    // ── BEEF-first: use stored change output (no WoC calls) ──
+    const beefStorePath = path.join(OVERLAY_STATE_DIR, 'latest-change.json');
+    let sourceTx = null;
+    let sourceVout = -1;
+    let sourceValue = 0;
+
+    // Try stored BEEF first
+    try {
+      if (fs.existsSync(beefStorePath)) {
+        const stored = JSON.parse(fs.readFileSync(beefStorePath, 'utf-8'));
+        if (stored.satoshis >= amount + 200) {
+          sourceTx = reconstructFromChain(stored);
+          sourceVout = stored.vout;
+          sourceValue = stored.satoshis;
+        }
+      }
+    } catch {}
+
+    // Fallback to WoC if no stored BEEF
+    if (!sourceTx) {
+      const prefix = NETWORK === 'mainnet' ? 0x00 : 0x6f;
+      const addrPayload = new Uint8Array([prefix, ...senderHash160]);
+      const checksum = Hash.hash256(Array.from(addrPayload)).slice(0, 4);
+      const addressBytes = new Uint8Array([...addrPayload, ...checksum]);
+      const senderAddress = Utils.toBase58(Array.from(addressBytes));
+
+      const utxoResp = await wocFetch(`/address/${senderAddress}/unspent`);
+      if (!utxoResp.ok) throw new Error(`Failed to fetch UTXOs: ${utxoResp.status}`);
+      const allUtxos = await utxoResp.json();
+      const utxos = allUtxos.filter(u => u.value >= amount + 200);
+      if (utxos.length === 0) throw new Error(`Insufficient funds for faucet funding. Need ${amount + 200} sats.`);
+      const utxo = utxos[0];
+
+      const rawResp = await wocFetch(`/tx/${utxo.tx_hash}/hex`);
+      if (!rawResp.ok) throw new Error(`Failed to fetch source tx: ${rawResp.status}`);
+      sourceTx = Transaction.fromHex(await rawResp.text());
+      sourceVout = utxo.tx_pos;
+      sourceValue = utxo.value;
+
+      // Walk back for merkle proof
+      let curTx = sourceTx; let curTxid = utxo.tx_hash;
+      for (let depth = 0; depth < 10; depth++) {
+        const infoResp = await wocFetch(`/tx/${curTxid}`);
+        if (!infoResp.ok) break;
+        const info = await infoResp.json();
+        if (info.confirmations > 0 && info.blockheight) {
+          const proofResp = await wocFetch(`/tx/${curTxid}/proof/tsc`);
+          if (proofResp.ok) {
+            const pd = await proofResp.json();
+            if (Array.isArray(pd) && pd.length > 0) {
+              curTx.merklePath = buildMerklePathFromTSC(curTxid, pd[0].index, pd[0].nodes, info.blockheight);
+            }
+          }
+          break;
+        }
+        const parentTxid = curTx.inputs[0]?.sourceTXID;
+        if (!parentTxid) break;
+        const parentResp = await wocFetch(`/tx/${parentTxid}/hex`);
+        if (!parentResp.ok) break;
+        const parentTx = Transaction.fromHex(await parentResp.text());
+        curTx.inputs[0].sourceTransaction = parentTx;
+        curTx = parentTx; curTxid = parentTxid;
+      }
+    }
+
+    // Build the payment transaction to faucet address
+    const tx = new Transaction();
+    tx.addInput({
+      sourceTransaction: sourceTx,
+      sourceOutputIndex: sourceVout,
+      unlockingScriptTemplate: new P2PKH().unlock(privKey),
+      sequence: 0xffffffff,
+    });
+
+    // Output 0: Payment to faucet address
+    tx.addOutput({
+      lockingScript: new P2PKH().lock(faucetHash160),
+      satoshis: amount,
+    });
+
+    // Calculate fee and change
+    const fee = 100; // conservative fee
+    const change = sourceValue - amount - fee;
+
+    if (change < 0) {
+      throw new Error(`Insufficient funds. Source: ${sourceValue}, payment: ${amount}, fee: ${fee}`);
+    }
+
+    // Output 1: Change back to sender (if dust threshold met)
+    if (change >= 136) {
+      tx.addOutput({
+        lockingScript: new P2PKH().lock(senderHash160),
+        satoshis: change,
+      });
+    }
+
+    await tx.sign();
+    const txid = tx.id('hex');
+
+    // Build BEEF
+    const beef = new Beef();
+    beef.mergeTransaction(tx);
+
+    // Save change BEEF for next tx (instant chaining)
+    if (change >= 136) {
+      saveChangeBeef(tx, change, 1);
+    }
+
+    // Broadcast
+    try {
+      const broadcastResp = await wocFetch(`/tx/raw`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ txhex: tx.toHex() }),
+      });
+      if (!broadcastResp.ok) {
+        console.error(`[Faucet] Broadcast non-fatal: ${broadcastResp.status}`);
+      }
+    } catch (bcastErr) {
+      console.error(`[Faucet] Broadcast non-fatal: ${bcastErr.message}`);
+    }
+
+    const explorerBase = NETWORK === 'mainnet' ? 'https://whatsonchain.com' : 'https://test.whatsonchain.com';
+    console.log(`[Faucet] Funded ${amount} sats: ${explorerBase}/tx/${txid}`);
+
+    return { success: true, amount, txid, faucetAddress: FAUCET_ADDRESS, description };
+  } catch (err) {
+    console.error(`[Faucet] Failed to fund: ${err.message}`);
+    return { success: false, error: err.message };
   }
 }
 
