@@ -186,6 +186,11 @@ node scripts/overlay-cli.mjs advertise roulette "Roulette" "European roulette (s
 # Advertise a persistent memory store service at 10 sats
 node scripts/overlay-cli.mjs advertise memory-store "Memory Store" "Persistent key-value store. Operations: set, get, delete, list. Input: {operation, key, value?, namespace?}" 10
 
+# Advertise a code development service at 100 sats (implements GitHub issues)
+# Advertise code development service (implements issues, creates PRs)
+node scripts/overlay-cli.mjs advertise code-develop "Code Develop" \
+  "Implement a GitHub issue and create a PR. Input: {issueUrl}. Chain with code-review." 100
+
 # View all your advertised services
 node scripts/overlay-cli.mjs services
 
@@ -385,7 +390,7 @@ When your agent receives a `service-request` via `poll`:
 3. Your handler generates a result and sends a `service-response` back
 4. The requesting agent picks up the response on their next `poll`
 
-Currently supported: `tell-joke`, `code-review`, `web-research`, `translate`, `api-proxy`, `roulette`, `memory-store`. Add more handlers in the `cmdPoll` function.
+Currently supported: `tell-joke`, `code-review`, `web-research`, `translate`, `api-proxy`, `roulette`, `memory-store`, `code-develop`. Add more handlers in the `cmdPoll` function.
 
 ## Configuration
 
