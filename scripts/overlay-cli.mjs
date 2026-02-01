@@ -1079,23 +1079,47 @@ async function cmdRefund(targetAddress) {
   const wocNet = NETWORK === 'mainnet' ? 'main' : 'test';
   const wocBase = `https://api.whatsonchain.com/v1/bsv/${wocNet}`;
 
+  // Refund sweeps all funds — needs WoC to discover all UTXOs (manual command)
   const utxoResp = await wocFetch(`/address/${sourceAddress}/unspent`);
   if (!utxoResp.ok) return fail(`Failed to fetch UTXOs: ${utxoResp.status}`);
   const utxos = await utxoResp.json();
   if (!utxos || utxos.length === 0) return fail(`No UTXOs found for ${sourceAddress}`);
 
+  // Also include stored BEEF change if available (may not be on-chain yet)
+  const beefStorePath = path.join(OVERLAY_STATE_DIR, 'latest-change.json');
+  let storedBeefTx = null;
+  let storedBeefIncluded = false;
+  try {
+    if (fs.existsSync(beefStorePath)) {
+      const stored = JSON.parse(fs.readFileSync(beefStorePath, 'utf-8'));
+      if (stored.satoshis > 0 && !utxos.some(u => u.tx_hash === stored.txid)) {
+        storedBeefTx = { stored, tx: reconstructFromChain(stored) };
+      }
+    }
+  } catch {}
+
+  const tx = new Transaction();
+  let totalInput = 0;
+
+  // Add stored BEEF input first (has full source chain, no WoC needed)
+  if (storedBeefTx) {
+    tx.addInput({
+      sourceTransaction: storedBeefTx.tx,
+      sourceOutputIndex: storedBeefTx.stored.vout,
+      unlockingScriptTemplate: new P2PKH().unlock(privKey),
+    });
+    totalInput += storedBeefTx.stored.satoshis;
+    storedBeefIncluded = true;
+  }
+
+  // Add WoC UTXOs
   const sourceTxCache = {};
   for (const utxo of utxos) {
     if (!sourceTxCache[utxo.tx_hash]) {
       const txResp = await wocFetch(`/tx/${utxo.tx_hash}/hex`);
-      if (!txResp.ok) return fail(`Failed to fetch source tx ${utxo.tx_hash}`);
+      if (!txResp.ok) continue; // skip on error, non-fatal for sweep
       sourceTxCache[utxo.tx_hash] = await txResp.text();
     }
-  }
-
-  const tx = new Transaction();
-  let totalInput = 0;
-  for (const utxo of utxos) {
     const srcTx = Transaction.fromHex(sourceTxCache[utxo.tx_hash]);
     tx.addInput({
       sourceTransaction: srcTx,
@@ -1105,6 +1129,8 @@ async function cmdRefund(targetAddress) {
     totalInput += utxo.value;
   }
 
+  if (totalInput === 0) return fail('No spendable funds found');
+
   const targetDecoded = Utils.fromBase58(targetAddress);
   const targetHash160 = targetDecoded.slice(1, 21);
   tx.addOutput({
@@ -1112,33 +1138,39 @@ async function cmdRefund(targetAddress) {
     satoshis: totalInput,
   });
 
-  const estimatedSize = utxos.length * 148 + 34 + 10;
+  const inputCount = tx.inputs.length;
+  const estimatedSize = inputCount * 148 + 34 + 10;
   const fee = Math.max(Math.ceil(estimatedSize / 1000), 100);
   if (totalInput <= fee) return fail(`Total value (${totalInput} sats) ≤ fee (${fee} sats)`);
   tx.outputs[0].satoshis = totalInput - fee;
 
   await tx.sign();
-  const rawTxHex = tx.toHex();
   const txid = tx.id('hex');
 
+  // Broadcast (required for refund — funds leave the overlay)
   const broadcastResp = await wocFetch(`/tx/raw`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ txhex: rawTxHex }),
+    body: JSON.stringify({ txhex: tx.toHex() }),
   });
 
   if (!broadcastResp.ok) {
     const errText = await broadcastResp.text();
     return fail(`Broadcast failed: ${broadcastResp.status} — ${errText}`);
   }
+
+  // Clear stored BEEF since we swept everything
+  try { fs.unlinkSync(beefStorePath); } catch {}
+
   const broadcastResult = await broadcastResp.text();
   const explorerBase = NETWORK === 'mainnet' ? 'https://whatsonchain.com' : 'https://test.whatsonchain.com';
 
   ok({
     txid: broadcastResult.replace(/"/g, '').trim(),
     satoshisSent: totalInput - fee,
-    fee, inputCount: utxos.length, totalInput,
+    fee, inputCount, totalInput,
     from: sourceAddress, to: targetAddress,
+    storedBeefIncluded,
     network: NETWORK,
     explorer: `${explorerBase}/tx/${txid}`,
   });
