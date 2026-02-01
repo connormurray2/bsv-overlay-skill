@@ -131,8 +131,9 @@ const PROTOCOL_ID = 'clawdbot-overlay-v1';
 /** 
  * Fetch from WhatsonChain with optional API key auth and retry logic.
  * Retries on 429 (rate limit) and 5xx errors with exponential backoff.
+ * Includes timeout to prevent hanging indefinitely.
  */
-async function wocFetch(urlPath, options = {}, maxRetries = 3) {
+async function wocFetch(urlPath, options = {}, maxRetries = 3, timeoutMs = 30000) {
   const wocNet = NETWORK === 'mainnet' ? 'main' : 'test';
   const base = `https://api.whatsonchain.com/v1/bsv/${wocNet}`;
   const url = urlPath.startsWith('http') ? urlPath : `${base}${urlPath}`;
@@ -142,7 +143,12 @@ async function wocFetch(urlPath, options = {}, maxRetries = 3) {
   let lastError;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      const resp = await fetch(url, { ...options, headers });
+      // Add timeout via AbortController
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), timeoutMs);
+      
+      const resp = await fetch(url, { ...options, headers, signal: controller.signal });
+      clearTimeout(timeout);
       
       // Retry on 429 (rate limit) or 5xx (server error)
       if ((resp.status === 429 || resp.status >= 500) && attempt < maxRetries) {
