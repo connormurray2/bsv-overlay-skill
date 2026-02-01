@@ -153,21 +153,32 @@ function startBackgroundService(env, cliPath, logger) {
           const event = JSON.parse(line);
           logger?.debug?.(`[bsv-overlay] ${event.event || event.type || 'message'}:`, JSON.stringify(event).slice(0, 200));
           
-          // Detect queued-for-agent events and write alert file
+          // Detect queued-for-agent events and wake the agent immediately
           if (event.action === 'queued-for-agent' && event.serviceId) {
-            const alertDir = path.join(process.env.HOME || '', '.clawdbot', 'bsv-overlay');
-            const alertPath = path.join(alertDir, 'pending-alert.jsonl');
-            try {
-              fs.mkdirSync(alertDir, { recursive: true });
-              fs.appendFileSync(alertPath, JSON.stringify({
-                requestId: event.id,
-                serviceId: event.serviceId,
-                from: event.from,
-                satoshis: event.satoshisReceived,
-                ts: Date.now(),
-              }) + '\n');
-              logger?.info?.(`[bsv-overlay] ⚡ Incoming ${event.serviceId} request from ${event.from?.slice(0, 12)}... — queued for agent`);
-            } catch {}
+            logger?.info?.(`[bsv-overlay] ⚡ Incoming ${event.serviceId} request from ${event.from?.slice(0, 12)}... — waking agent`);
+            
+            // Wake the agent via gateway cron.wake RPC (fire-and-forget)
+            const wakeText = `⚡ Incoming overlay service request: ${event.serviceId} from ${event.from?.slice(0, 16)}... (${event.satoshisReceived || '?'} sats paid). Check overlay({ action: "pending-requests" }) for details, fulfill it using your capabilities, then call overlay({ action: "fulfill", requestId: "...", recipientKey: "...", serviceId: "...", result: {...} }).`;
+            (async () => {
+              try {
+                const gatewayUrl = 'http://127.0.0.1:18789';
+                const wakeResp = await fetch(gatewayUrl, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: `overlay-wake-${Date.now()}`,
+                    method: 'cron.wake',
+                    params: { mode: 'now', text: wakeText },
+                  }),
+                });
+                if (wakeResp.ok) {
+                  logger?.info?.('[bsv-overlay] Agent woken for service fulfillment');
+                }
+              } catch (wakeErr: any) {
+                logger?.warn?.('[bsv-overlay] Failed to wake agent:', wakeErr.message);
+              }
+            })();
           }
         } catch {}
       }
