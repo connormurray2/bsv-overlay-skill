@@ -141,10 +141,16 @@ function stopAutoImport() {
   }
 }
 
+// Discover the gateway WebSocket port from environment
+function getGatewayWsUrl(): string {
+  const port = process.env.CLAWDBOT_GATEWAY_PORT || process.env.OPENCLAW_GATEWAY_PORT || '18789';
+  return `ws://127.0.0.1:${port}`;
+}
+
 // Wake the agent via gateway WebSocket JSON-RPC (event-driven, zero polling)
 function wakeAgent(text: string, logger?: any) {
   try {
-    const ws = new WebSocket('ws://127.0.0.1:18789');
+    const ws = new WebSocket(getGatewayWsUrl());
     const timeout = setTimeout(() => { try { ws.close(); } catch {} }, 5000);
     ws.on('open', () => {
       ws.send(JSON.stringify({
@@ -579,19 +585,8 @@ export default function register(api) {
           if (regOutput.success) {
             api.log?.info?.('[bsv-overlay] Auto-registered on overlay network! Waking agent for service selection...');
             // Wake the agent to present service selection to the user
-            try {
-              const wakeText = `🎉 BSV Overlay: Auto-registered on the network! Two things to set up:\n\n1. **Agent name**: Ask the user what name they want for their agent on the network. The current default is "${env.AGENT_NAME}". If they want a different name, they need to set it in the plugin config (agentName) and re-register.\n\n2. **Services**: Ask the user which services they want to advertise. Call overlay({ action: "register" }) to get the full list of available services with descriptions and suggested prices, then present them to the user. Let them choose which ones to enable. For each selected service, call overlay({ action: "advertise", serviceId: "...", name: "...", description: "...", priceSats: N }).`;
-              await fetch('http://127.0.0.1:18789', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  jsonrpc: '2.0',
-                  id: `overlay-service-select-${Date.now()}`,
-                  method: 'cron.wake',
-                  params: { mode: 'now', text: wakeText },
-                }),
-              });
-            } catch {}
+            const wakeText = `🎉 BSV Overlay: Auto-registered on the network! Two things to set up:\n\n1. **Agent name**: Ask the user what name they want for their agent on the network. The current default is "${env.AGENT_NAME}". If they want a different name, they need to set it in the plugin config (agentName) and re-register.\n\n2. **Services**: Ask the user which services they want to advertise. Call overlay({ action: "register" }) to get the full list of available services with descriptions and suggested prices, then present them to the user. Let them choose which ones to enable. For each selected service, call overlay({ action: "advertise", serviceId: "...", name: "...", description: "...", priceSats: N }).`;
+            wakeAgent(wakeText, api.log);
           }
         }
       }
