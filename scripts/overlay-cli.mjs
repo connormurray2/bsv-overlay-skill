@@ -1878,6 +1878,25 @@ function formatServiceResponse(serviceId, status, result) {
         details: result,
       };
     
+    case 'code-develop':
+      let devSummary = result?.error 
+        ? `Development failed: ${result.error}` 
+        : result?.prUrl 
+          ? `PR created: ${result.prUrl}`
+          : 'Development completed';
+      return {
+        ...base,
+        type: 'code-develop',
+        summary: devSummary,
+        details: {
+          issueUrl: result?.issueUrl,
+          prUrl: result?.prUrl,
+          branch: result?.branch,
+          commits: result?.commits,
+          error: result?.error,
+        },
+      };
+    
     default:
       // Generic service response — show preview of result
       const resultPreview = result
@@ -2062,6 +2081,8 @@ async function processMessage(msg, identityKey, privKey) {
       return await processRoulette(msg, identityKey, privKey);
     } else if (serviceId === 'memory-store') {
       return await processMemoryStore(msg, identityKey, privKey);
+    } else if (serviceId === 'code-develop') {
+      return await processCodeDevelop(msg, identityKey, privKey);
     } else {
       // Unknown service — don't auto-process
       return {
@@ -3365,6 +3386,303 @@ async function processMemoryStore(msg, identityKey, privKey) {
     from: msg.from,
     ack: true,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Service: code-develop (100 sats) — Implement a GitHub issue and open a PR
+// ---------------------------------------------------------------------------
+
+const CODE_DEVELOP_PRICE = 100;
+
+async function processCodeDevelop(msg, identityKey, privKey) {
+  const input = msg.payload?.input || msg.payload;
+  const issueUrl = input?.issueUrl || input?.issue;
+
+  // Helper to send rejection
+  async function reject(reason, shortReason) {
+    const rejectPayload = {
+      requestId: msg.id,
+      serviceId: 'code-develop',
+      status: 'rejected',
+      reason,
+    };
+    const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+    await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
+    }, 15000);
+    return { id: msg.id, type: 'service-request', serviceId: 'code-develop', action: 'rejected', reason: shortReason, from: msg.from, ack: true };
+  }
+
+  // Validate issue URL
+  if (!issueUrl || typeof issueUrl !== 'string') {
+    return reject('Missing issue URL. Send {issueUrl: "https://github.com/owner/repo/issues/123"}', 'no issue URL');
+  }
+
+  const issueMatch = issueUrl.match(/github\.com\/([^/]+)\/([^/]+)\/issues\/(\d+)/);
+  if (!issueMatch) {
+    return reject('Invalid issue URL format. Expected: https://github.com/owner/repo/issues/123', 'invalid URL');
+  }
+
+  const [, owner, repo, issueNumber] = issueMatch;
+
+  // Security: validate owner/repo names
+  const safeNameRegex = /^[a-zA-Z0-9._-]+$/;
+  if (!safeNameRegex.test(owner) || !safeNameRegex.test(repo)) {
+    return reject('Invalid owner/repo name — only alphanumeric, dots, hyphens, and underscores allowed', 'invalid repo name');
+  }
+  if (!/^\d+$/.test(issueNumber)) {
+    return reject('Invalid issue number — must be numeric', 'invalid issue number');
+  }
+
+  // ── Payment verification ──
+  let walletIdentity;
+  try {
+    walletIdentity = JSON.parse(fs.readFileSync(path.join(WALLET_DIR, 'wallet-identity.json'), 'utf-8'));
+  } catch (err) {
+    return reject(`Wallet identity not found or corrupted: ${err.message}`, 'wallet error');
+  }
+  const ourHash160 = Hash.hash160(PrivateKey.fromHex(walletIdentity.rootKeyHex).toPublicKey().encode(true));
+  const payResult = await verifyAndAcceptPayment(msg.payload?.payment, CODE_DEVELOP_PRICE, msg.from, 'code-develop', ourHash160);
+  if (!payResult.accepted) {
+    return reject(`Payment rejected: ${payResult.error}. Code development costs ${CODE_DEVELOP_PRICE} sats.`, payResult.error);
+  }
+
+  const paymentTxid = payResult.txid;
+  const paymentSats = payResult.satoshis;
+  const walletAccepted = payResult.walletAccepted;
+  const acceptError = payResult.error;
+
+  // ── Perform the development work ──
+  let devResult;
+  try {
+    devResult = await performCodeDevelopment(owner, repo, issueNumber, issueUrl);
+  } catch (err) {
+    devResult = { error: `Development failed: ${err instanceof Error ? err.message : String(err)}` };
+  }
+
+  // Send response
+  const responsePayload = {
+    requestId: msg.id,
+    serviceId: 'code-develop',
+    status: devResult.error ? 'failed' : 'fulfilled',
+    result: devResult,
+    paymentAccepted: true,
+    paymentTxid,
+    satoshisReceived: paymentSats,
+    walletAccepted,
+    ...(acceptError ? { walletError: acceptError } : {}),
+  };
+  const respSig = signRelayMessage(privKey, msg.from, 'service-response', responsePayload);
+  await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      from: identityKey, to: msg.from, type: 'service-response',
+      payload: responsePayload, signature: respSig,
+    }),
+  }, 15000);
+
+  return {
+    id: msg.id,
+    type: 'service-request',
+    serviceId: 'code-develop',
+    action: devResult.error ? 'failed' : 'fulfilled',
+    result: devResult,
+    paymentAccepted: true,
+    paymentTxid,
+    satoshisReceived: paymentSats,
+    walletAccepted,
+    direction: 'incoming-request',
+    formatted: {
+      type: 'code-develop',
+      summary: devResult.error || `PR created: ${devResult.prUrl}`,
+      earnings: paymentSats,
+    },
+    ...(acceptError ? { walletError: acceptError } : {}),
+    from: msg.from,
+    ack: true,
+  };
+}
+
+/**
+ * Perform code development: clone repo, implement issue, create PR.
+ * Uses Claude Code CLI for the implementation work.
+ */
+async function performCodeDevelopment(owner, repo, issueNumber, issueUrl) {
+  const { execFileSync, spawnSync } = await import('child_process');
+  const tmpDir = path.join(os.tmpdir(), `code-develop-${owner}-${repo}-${issueNumber}-${Date.now()}`);
+
+  try {
+    // 1. Fetch issue details
+    let issueInfo;
+    try {
+      issueInfo = JSON.parse(execFileSync(
+        'gh', ['issue', 'view', issueNumber, '--repo', `${owner}/${repo}`, '--json', 'title,body,labels,author'],
+        { encoding: 'utf-8', timeout: 30000 },
+      ));
+    } catch (e) {
+      return { error: `Failed to fetch issue: ${e.message}`, issueUrl };
+    }
+
+    const issueTitle = issueInfo.title || `Issue #${issueNumber}`;
+    const issueBody = issueInfo.body || '';
+    const labels = (issueInfo.labels || []).map(l => l.name).join(', ');
+
+    // 2. Clone the repository
+    try {
+      fs.mkdirSync(tmpDir, { recursive: true });
+      execFileSync('gh', ['repo', 'clone', `${owner}/${repo}`, tmpDir], {
+        encoding: 'utf-8',
+        timeout: 120000, // 2 min for large repos
+      });
+    } catch (e) {
+      return { error: `Failed to clone repository: ${e.message}`, issueUrl };
+    }
+
+    // 3. Create a feature branch
+    const branchName = `fix/issue-${issueNumber}`;
+    try {
+      execFileSync('git', ['checkout', '-b', branchName], {
+        cwd: tmpDir,
+        encoding: 'utf-8',
+        timeout: 10000,
+      });
+    } catch (e) {
+      return { error: `Failed to create branch: ${e.message}`, issueUrl };
+    }
+
+    // 4. Use Claude Code to implement the issue
+    const prompt = `You are implementing GitHub issue #${issueNumber} for ${owner}/${repo}.
+
+## Issue Title
+${issueTitle}
+
+## Issue Description
+${issueBody}
+
+${labels ? `## Labels: ${labels}` : ''}
+
+## Instructions
+1. Read the codebase to understand the project structure
+2. Implement the changes required to resolve this issue
+3. Follow existing code style and patterns
+4. Add or update tests if appropriate
+5. Make sure the code compiles/runs without errors
+6. Commit your changes with a clear commit message referencing the issue
+
+When done, your commit message should start with "fix: " or "feat: " and reference #${issueNumber}.`;
+
+    let claudeResult;
+    try {
+      // Run Claude Code with timeout (5 minutes for implementation)
+      claudeResult = spawnSync('claude', ['-p', prompt], {
+        cwd: tmpDir,
+        encoding: 'utf-8',
+        timeout: 300000, // 5 minutes
+        maxBuffer: 10 * 1024 * 1024, // 10MB
+        env: { ...process.env, CLAUDE_CODE_ENTRYPOINT: 'cli' },
+      });
+
+      if (claudeResult.status !== 0 && claudeResult.status !== null) {
+        const errMsg = claudeResult.stderr || claudeResult.stdout || 'Unknown error';
+        return { error: `Claude Code failed (exit ${claudeResult.status}): ${errMsg.slice(0, 500)}`, issueUrl };
+      }
+    } catch (e) {
+      return { error: `Claude Code execution failed: ${e.message}`, issueUrl };
+    }
+
+    // 5. Check if there are any commits
+    let commitCount;
+    try {
+      const logResult = execFileSync('git', ['rev-list', '--count', `main..${branchName}`], {
+        cwd: tmpDir,
+        encoding: 'utf-8',
+        timeout: 10000,
+      }).trim();
+      commitCount = parseInt(logResult, 10) || 0;
+    } catch {
+      // Try with master if main doesn't exist
+      try {
+        const logResult = execFileSync('git', ['rev-list', '--count', `master..${branchName}`], {
+          cwd: tmpDir,
+          encoding: 'utf-8',
+          timeout: 10000,
+        }).trim();
+        commitCount = parseInt(logResult, 10) || 0;
+      } catch {
+        commitCount = 0;
+      }
+    }
+
+    if (commitCount === 0) {
+      // No commits made - Claude didn't make changes, or made them but didn't commit
+      // Try to commit any staged/unstaged changes
+      try {
+        execFileSync('git', ['add', '-A'], { cwd: tmpDir, timeout: 10000 });
+        execFileSync('git', ['commit', '-m', `fix: implement issue #${issueNumber}\n\n${issueTitle}`], {
+          cwd: tmpDir,
+          encoding: 'utf-8',
+          timeout: 10000,
+        });
+        commitCount = 1;
+      } catch {
+        return { error: 'No changes were made to resolve the issue', issueUrl };
+      }
+    }
+
+    // 6. Push the branch (requires gh auth or git credentials)
+    try {
+      execFileSync('git', ['push', '-u', 'origin', branchName], {
+        cwd: tmpDir,
+        encoding: 'utf-8',
+        timeout: 60000,
+      });
+    } catch (e) {
+      return { error: `Failed to push branch: ${e.message}`, issueUrl, branch: branchName, commits: commitCount };
+    }
+
+    // 7. Create the PR
+    let prUrl;
+    try {
+      const prResult = execFileSync('gh', [
+        'pr', 'create',
+        '--repo', `${owner}/${repo}`,
+        '--head', branchName,
+        '--title', `fix: ${issueTitle}`,
+        '--body', `## Summary\nThis PR implements the changes requested in #${issueNumber}.\n\n## Issue\nCloses #${issueNumber}\n\n## Changes\nImplemented by automated code development service.\n\n---\n_Generated by [BSV Overlay Skill](https://github.com/galt-tr/bsv-overlay-skill) code-develop service_`,
+      ], {
+        cwd: tmpDir,
+        encoding: 'utf-8',
+        timeout: 30000,
+      }).trim();
+      prUrl = prResult;
+    } catch (e) {
+      return { 
+        error: `Failed to create PR: ${e.message}`, 
+        issueUrl, 
+        branch: branchName, 
+        commits: commitCount,
+        note: 'Branch was pushed successfully. You may create the PR manually.',
+      };
+    }
+
+    return {
+      issueUrl,
+      issueTitle,
+      prUrl,
+      branch: branchName,
+      commits: commitCount,
+      message: `Successfully implemented issue #${issueNumber} and created PR`,
+    };
+
+  } finally {
+    // Cleanup: remove temp directory
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    } catch { /* ignore cleanup errors */ }
+  }
 }
 
 /** Analyze a GitHub PR diff for common issues. */
