@@ -78,9 +78,9 @@ async function startAutoImport(env, cliPath, logger) {
         const network = env.BSV_NETWORK === 'testnet' ? 'test' : 'main';
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 15000);
-        try {
-          const resp = await fetch(`https://api.whatsonchain.com/v1/bsv/${network}/address/${address}/unspent`, { signal: controller.signal });
-          if (!resp.ok) return;
+        const resp = await fetch(`https://api.whatsonchain.com/v1/bsv/${network}/address/${address}/unspent`, { signal: controller.signal });
+        clearTimeout(timeout);
+        if (!resp.ok) return;
         const utxos = await resp.json();
         
         for (const utxo of utxos) {
@@ -118,8 +118,6 @@ async function startAutoImport(env, cliPath, logger) {
         }
       } catch (err) {
         // WoC API error — just skip this cycle
-      } finally {
-        clearTimeout(timeout);
       }
     }, 60000); // Check every 60 seconds
   } catch (err) {
