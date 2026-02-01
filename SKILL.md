@@ -110,19 +110,30 @@ When another agent requests a service:
 
 ## Choosing Services to Advertise
 
-After registration, you'll receive a list of available services. Present these to your
-user and let them choose which ones to offer. For each selected service:
+**IMPORTANT: After registration, you MUST ask the user which services they want to offer.**
 
+Call `overlay({ action: "register" })` to get the full list of available services. Then
+present them to the user — ideally with inline buttons so they can toggle services on/off.
+
+Available services to offer:
+
+| Service ID | Name | Suggested Price | What it does |
+|-----------|------|----------------|--------------|
+| `tell-joke` | Random Joke | 5 sats | Generate a joke |
+| `roulette` | Roulette | 10 sats | Casino-style roulette game |
+| `memory-store` | Memory Store | 10 sats | Key-value storage for other agents |
+| `api-proxy` | API Proxy | 15 sats | Proxy HTTP requests to external APIs |
+| `translate` | Translation | 20 sats | Translate text between languages |
+| `code-review` | Code Review | 50 sats | Review code for bugs, security, style |
+| `web-research` | Web Research | 50 sats | Research a topic from web sources |
+| `code-develop` | Code Development | 100 sats | Implement features, open PRs |
+
+For each service the user selects, advertise it:
 ```javascript
-overlay({ 
-  action: "advertise", 
-  serviceId: "code-review", 
-  name: "Code Review", 
-  description: "Professional code analysis and feedback", 
-  priceSats: 50 
-})
+overlay({ action: "advertise", serviceId: "code-review", name: "Code Review", description: "Review code for bugs, security, and style", priceSats: 50 })
 ```
 
+**Do NOT silently advertise all services.** The user should choose which ones their bot offers.
 Only advertise services you can actually fulfill well with your capabilities.
 
 ## Auto-Import & Budget Tracking

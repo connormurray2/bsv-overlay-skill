@@ -526,7 +526,21 @@ export default function register(api) {
           const regResult = await execFileAsync('node', [cliPath, 'register'], { env, timeout: 60000 });
           const regOutput = parseCliOutput(regResult.stdout);
           if (regOutput.success) {
-            api.log?.info?.('[bsv-overlay] Auto-registered on overlay network!');
+            api.log?.info?.('[bsv-overlay] Auto-registered on overlay network! Waking agent for service selection...');
+            // Wake the agent to present service selection to the user
+            try {
+              const wakeText = `🎉 BSV Overlay: Auto-registered on the network! Now ask the user which services they want to advertise. Call overlay({ action: "register" }) to get the full list of available services with descriptions and suggested prices, then present them to the user. Let them choose which ones to enable. For each selected service, call overlay({ action: "advertise", serviceId: "...", name: "...", description: "...", priceSats: N }).`;
+              await fetch('http://127.0.0.1:18789', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  jsonrpc: '2.0',
+                  id: `overlay-service-select-${Date.now()}`,
+                  method: 'cron.wake',
+                  params: { mode: 'now', text: wakeText },
+                }),
+              });
+            } catch {}
           }
         }
       }
