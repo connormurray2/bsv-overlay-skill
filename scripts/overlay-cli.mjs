@@ -4,29 +4,47 @@
  *
  * Combines BSV wallet management, overlay registration/discovery, service
  * advertisement, and micropayments into a single self-contained CLI.
+ * Now with MNEE stablecoin support for dual-currency payments.
  *
  * All output is JSON with a { success, data/error } wrapper for agent parsing.
  *
  * Environment variables:
- *   BSV_WALLET_DIR  — wallet storage directory (default: ~/.clawdbot/bsv-wallet)
- *   BSV_NETWORK     — 'mainnet' or 'testnet' (default: mainnet)
- *   OVERLAY_URL     — overlay server URL (default: http://162.243.168.235:8080)
- *   AGENT_NAME      — agent display name for registration
+ *   BSV_WALLET_DIR   — BSV wallet storage directory (default: ~/.clawdbot/bsv-wallet)
+ *   BSV_NETWORK      — 'mainnet' or 'testnet' (default: mainnet)
+ *   OVERLAY_URL      — overlay server URL (default: http://162.243.168.235:8080)
+ *   AGENT_NAME       — agent display name for registration
+ *   MNEE_WALLET_DIR  — MNEE wallet storage directory (default: ~/.clawdbot/mnee-wallet)
+ *   MNEE_API_KEY     — MNEE SDK API key (optional for some operations)
+ *   MNEE_ENVIRONMENT — 'production' or 'sandbox' (default: production)
+ *   DEFAULT_CURRENCY — 'bsv' or 'mnee' (default: bsv)
+ *   MNEE_SATS_RATIO  — Exchange rate: 1 sat = X MNEE (default: 0.00001)
  *
- * Commands:
+ * BSV Wallet Commands:
  *   setup                                              — Create wallet, show identity
  *   identity                                           — Show identity public key
  *   address                                            — Show P2PKH receive address
  *   balance                                            — Show balance in satoshis
  *   import <txid> [vout]                               — Import external UTXO with merkle proof
  *   refund <address>                                   — Sweep wallet to address
+ *
+ * MNEE Stablecoin Commands:
+ *   mnee-setup                                         — Create MNEE HD wallet, show first address
+ *   mnee-address                                       — Show current MNEE receive address
+ *   mnee-new-address                                   — Derive a new MNEE receive address
+ *   mnee-balance                                       — Show MNEE balance across all addresses
+ *   mnee-send <address> <amount>                       — Send MNEE to an address
+ *   wallet-preference [bsv|mnee]                       — Get/set default payment currency
+ *
+ * Overlay Commands:
  *   register                                           — Register identity + joke service on overlay
  *   unregister                                         — (future) Remove from overlay
  *   services                                           — List my advertised services
  *   advertise <serviceId> <name> <desc> <priceSats>    — Add a service to overlay
  *   remove <serviceId>                                 — Remove a service (future)
  *   discover [--service <type>] [--agent <name>]       — Find agents/services on overlay
- *   pay <identityKey> <sats> [description]             — Pay another agent
+ *
+ * Payment Commands:
+ *   pay <identityKey> <sats> [description]             — Pay another agent (BSV)
  *   verify <beef_base64>                               — Verify incoming payment
  *   accept <beef> <prefix> <suffix> <senderKey> [desc] — Accept payment
  *
@@ -106,6 +124,17 @@ console.log = _origLog;
 const { PrivateKey, PublicKey, Hash, Utils, Transaction, Script, P2PKH, Beef, MerklePath, Signature } = sdk;
 
 // ---------------------------------------------------------------------------
+// Resolve MNEE SDK (optional - for stablecoin payments)
+// ---------------------------------------------------------------------------
+let Mnee = null;
+try {
+  const mneeModule = await import('@mnee/ts-sdk');
+  Mnee = mneeModule.default || mneeModule.Mnee;
+} catch {
+  // MNEE SDK not available - stablecoin features will be disabled
+}
+
+// ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 
@@ -127,6 +156,40 @@ const OVERLAY_URL = process.env.OVERLAY_URL || 'http://162.243.168.235:8080';
 const WOC_API_KEY = process.env.WOC_API_KEY || '';
 const OVERLAY_STATE_DIR = path.join(os.homedir(), '.clawdbot', 'bsv-overlay');
 const PROTOCOL_ID = 'clawdbot-overlay-v1';
+
+// ---------------------------------------------------------------------------
+// MNEE Stablecoin Config
+// ---------------------------------------------------------------------------
+const MNEE_WALLET_DIR = process.env.MNEE_WALLET_DIR
+  || path.join(os.homedir(), '.clawdbot', 'mnee-wallet');
+const MNEE_API_KEY = process.env.MNEE_API_KEY || '';
+const MNEE_ENVIRONMENT = process.env.MNEE_ENVIRONMENT || 'production';
+const DEFAULT_CURRENCY = process.env.DEFAULT_CURRENCY || 'bsv';
+const MNEE_DERIVATION_PATH = "m/44'/236'/0'";
+
+// MNEE Pricing: 1 MNEE = 100,000 atomic units
+// Default price conversions (approximate):
+// 1 sat ≈ 0.000001 MNEE (based on rough BSV/USD parity)
+// Adjust MNEE_SATS_RATIO to set the exchange rate
+const MNEE_SATS_RATIO = parseFloat(process.env.MNEE_SATS_RATIO) || 0.00001; // 1 sat = 0.00001 MNEE
+
+/**
+ * Convert satoshis to MNEE amount.
+ * @param {number} sats - Amount in satoshis
+ * @returns {number} - Amount in MNEE (decimal)
+ */
+function satsToMnee(sats) {
+  return sats * MNEE_SATS_RATIO;
+}
+
+/**
+ * Convert MNEE amount to satoshis.
+ * @param {number} mnee - Amount in MNEE (decimal)
+ * @returns {number} - Amount in satoshis
+ */
+function mneeToSats(mnee) {
+  return Math.round(mnee / MNEE_SATS_RATIO);
+}
 
 /** 
  * Fetch from WhatsonChain with optional API key auth and retry logic.
@@ -1218,6 +1281,574 @@ async function cmdRefund(targetAddress) {
     network: NETWORK,
     explorer: `${explorerBase}/tx/${txid}`,
   });
+}
+
+// ---------------------------------------------------------------------------
+// MNEE Wallet Commands (Stablecoin Support)
+// ---------------------------------------------------------------------------
+
+/**
+ * Load MNEE wallet data from disk.
+ * @returns {{ mnemonic: string, addresses: Object[], currentIndex: number } | null}
+ */
+function loadMneeWallet() {
+  const walletPath = path.join(MNEE_WALLET_DIR, 'mnee-wallet.json');
+  if (!fs.existsSync(walletPath)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(walletPath, 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Save MNEE wallet data to disk.
+ * @param {Object} walletData - Wallet data to save
+ */
+function saveMneeWallet(walletData) {
+  fs.mkdirSync(MNEE_WALLET_DIR, { recursive: true });
+  const walletPath = path.join(MNEE_WALLET_DIR, 'mnee-wallet.json');
+  fs.writeFileSync(walletPath, JSON.stringify(walletData, null, 2), 'utf-8');
+  // Secure the wallet file
+  try {
+    fs.chmodSync(walletPath, 0o600);
+  } catch {}
+}
+
+/**
+ * Load wallet currency preference.
+ * @returns {'bsv' | 'mnee'}
+ */
+function loadWalletPreference() {
+  const prefPath = path.join(OVERLAY_STATE_DIR, 'wallet-preference.json');
+  try {
+    if (fs.existsSync(prefPath)) {
+      const pref = JSON.parse(fs.readFileSync(prefPath, 'utf-8'));
+      return pref.currency || DEFAULT_CURRENCY;
+    }
+  } catch {}
+  return DEFAULT_CURRENCY;
+}
+
+/**
+ * Save wallet currency preference.
+ * @param {'bsv' | 'mnee'} currency
+ */
+function saveWalletPreference(currency) {
+  fs.mkdirSync(OVERLAY_STATE_DIR, { recursive: true });
+  const prefPath = path.join(OVERLAY_STATE_DIR, 'wallet-preference.json');
+  fs.writeFileSync(prefPath, JSON.stringify({ currency, updatedAt: new Date().toISOString() }), 'utf-8');
+}
+
+/**
+ * Initialize the MNEE SDK instance.
+ * @param {boolean} requireApiKey - Whether to require API key (false for local-only ops)
+ * @returns {Object|null} - MNEE SDK instance or null if not available
+ */
+function initMneeSdk(requireApiKey = true) {
+  if (!Mnee) return null;
+  try {
+    // For local-only operations (wallet generation), API key is optional
+    const config = {
+      environment: MNEE_ENVIRONMENT,
+    };
+    
+    // Only add API key if provided or required
+    if (MNEE_API_KEY) {
+      config.apiKey = MNEE_API_KEY;
+    } else if (requireApiKey) {
+      // Some operations like balance/transfer need API key
+      console.error(`[MNEE] API key required for this operation. Set MNEE_API_KEY environment variable.`);
+      return null;
+    }
+    
+    return new Mnee(config);
+  } catch (err) {
+    // If SDK fails without API key, try creating without config
+    if (!requireApiKey) {
+      try {
+        return new Mnee({ environment: MNEE_ENVIRONMENT });
+      } catch {
+        // Final fallback - just return the class for static methods
+        return { HDWallet: Mnee.HDWallet };
+      }
+    }
+    console.error(`[MNEE] SDK initialization failed: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * Setup MNEE HD wallet — generates mnemonic and first address.
+ * Note: This is a local-only operation that doesn't require an API key.
+ */
+async function cmdMneeSetup() {
+  if (!Mnee) {
+    return fail('MNEE SDK not available. Install it: npm install @mnee/ts-sdk');
+  }
+
+  const existingWallet = loadMneeWallet();
+  if (existingWallet) {
+    // Wallet already exists — return existing address
+    const currentAddr = existingWallet.addresses[existingWallet.currentIndex];
+    return ok({
+      mneeWalletDir: MNEE_WALLET_DIR,
+      address: currentAddr?.address || null,
+      alreadyExisted: true,
+      environment: MNEE_ENVIRONMENT,
+      note: 'MNEE wallet already initialized. Use mnee-address to see receive address.',
+    });
+  }
+
+  try {
+    // Generate HD wallet mnemonic (static method - no API key needed)
+    const mnemonic = Mnee.HDWallet.generateMnemonic();
+    
+    // Initialize SDK for HD wallet operations (local-only, no API key required)
+    const mnee = initMneeSdk(false);
+    if (!mnee || !mnee.HDWallet) {
+      return fail('Failed to initialize MNEE SDK for wallet generation.');
+    }
+    
+    const hdWallet = mnee.HDWallet(mnemonic, { derivationPath: MNEE_DERIVATION_PATH });
+    
+    // Derive first address
+    const firstAddress = hdWallet.deriveAddress(0, false);
+    
+    const walletData = {
+      mnemonic,
+      derivationPath: MNEE_DERIVATION_PATH,
+      addresses: [{
+        index: 0,
+        address: firstAddress.address,
+        path: firstAddress.path,
+        // Note: We don't store private keys in the wallet file
+        // They are derived on-demand from the mnemonic
+      }],
+      currentIndex: 0,
+      createdAt: new Date().toISOString(),
+    };
+    
+    saveMneeWallet(walletData);
+    
+    ok({
+      mneeWalletDir: MNEE_WALLET_DIR,
+      address: firstAddress.address,
+      derivationPath: MNEE_DERIVATION_PATH,
+      environment: MNEE_ENVIRONMENT,
+      alreadyExisted: false,
+      note: 'MNEE wallet created. Fund this address with MNEE stablecoin.',
+    });
+  } catch (err) {
+    fail(`MNEE wallet setup failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/**
+ * Show current MNEE receive address.
+ */
+async function cmdMneeAddress() {
+  if (!Mnee) {
+    return fail('MNEE SDK not available. Install it: npm install @mnee/ts-sdk');
+  }
+
+  const wallet = loadMneeWallet();
+  if (!wallet) {
+    return fail('MNEE wallet not initialized. Run: mnee-setup');
+  }
+
+  const currentAddr = wallet.addresses[wallet.currentIndex];
+  ok({
+    address: currentAddr?.address || null,
+    index: wallet.currentIndex,
+    derivationPath: wallet.derivationPath,
+    environment: MNEE_ENVIRONMENT,
+    note: 'Fund this address with MNEE stablecoin.',
+  });
+}
+
+/**
+ * Derive a new MNEE receive address.
+ * Note: This is a local-only operation that doesn't require an API key.
+ */
+async function cmdMneeNewAddress() {
+  if (!Mnee) {
+    return fail('MNEE SDK not available. Install it: npm install @mnee/ts-sdk');
+  }
+
+  const wallet = loadMneeWallet();
+  if (!wallet) {
+    return fail('MNEE wallet not initialized. Run: mnee-setup');
+  }
+
+  const mnee = initMneeSdk(false); // Local operation - no API key needed
+  if (!mnee || !mnee.HDWallet) {
+    return fail('Failed to initialize MNEE SDK for address derivation.');
+  }
+
+  try {
+    const hdWallet = mnee.HDWallet(wallet.mnemonic, { derivationPath: wallet.derivationPath });
+    const newIndex = wallet.addresses.length;
+    const newAddress = hdWallet.deriveAddress(newIndex, false);
+    
+    wallet.addresses.push({
+      index: newIndex,
+      address: newAddress.address,
+      path: newAddress.path,
+    });
+    wallet.currentIndex = newIndex;
+    saveMneeWallet(wallet);
+    
+    ok({
+      address: newAddress.address,
+      index: newIndex,
+      derivationPath: wallet.derivationPath,
+      note: 'New MNEE address derived. This is now your current receive address.',
+    });
+  } catch (err) {
+    fail(`Failed to derive new address: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/**
+ * Show MNEE wallet balance.
+ */
+async function cmdMneeBalance() {
+  if (!Mnee) {
+    return fail('MNEE SDK not available. Install it: npm install @mnee/ts-sdk');
+  }
+
+  const wallet = loadMneeWallet();
+  if (!wallet) {
+    return fail('MNEE wallet not initialized. Run: mnee-setup');
+  }
+
+  const mnee = initMneeSdk();
+  if (!mnee) {
+    return fail('Failed to initialize MNEE SDK.');
+  }
+
+  try {
+    // Check balance for all derived addresses
+    let totalBalance = 0;
+    let totalAtomicBalance = 0;
+    const addressBalances = [];
+
+    for (const addr of wallet.addresses) {
+      try {
+        const bal = await mnee.balance(addr.address);
+        const amount = parseFloat(bal.decimalAmount || bal.amount || 0);
+        const atomicAmount = parseInt(bal.amount || 0, 10);
+        totalBalance += amount;
+        totalAtomicBalance += atomicAmount;
+        if (amount > 0) {
+          addressBalances.push({
+            address: addr.address,
+            index: addr.index,
+            balance: amount,
+            atomicBalance: atomicAmount,
+          });
+        }
+      } catch {
+        // Address might not exist on chain yet
+      }
+    }
+
+    ok({
+      totalBalance,
+      totalAtomicBalance,
+      unit: 'MNEE',
+      addressCount: wallet.addresses.length,
+      addressesWithBalance: addressBalances.length,
+      addresses: addressBalances,
+      currentAddress: wallet.addresses[wallet.currentIndex]?.address,
+      environment: MNEE_ENVIRONMENT,
+    });
+  } catch (err) {
+    fail(`Failed to fetch MNEE balance: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/**
+ * Send MNEE to an address.
+ * @param {string} toAddress - Recipient address
+ * @param {string} amountStr - Amount in MNEE (decimal)
+ */
+async function cmdMneeSend(toAddress, amountStr) {
+  if (!toAddress || !amountStr) {
+    return fail('Usage: mnee-send <address> <amount>');
+  }
+
+  if (!Mnee) {
+    return fail('MNEE SDK not available. Install it: npm install @mnee/ts-sdk');
+  }
+
+  const wallet = loadMneeWallet();
+  if (!wallet) {
+    return fail('MNEE wallet not initialized. Run: mnee-setup');
+  }
+
+  const amount = parseFloat(amountStr);
+  if (isNaN(amount) || amount <= 0) {
+    return fail('Amount must be a positive number');
+  }
+
+  const mnee = initMneeSdk();
+  if (!mnee) {
+    return fail('Failed to initialize MNEE SDK.');
+  }
+
+  try {
+    const hdWallet = mnee.HDWallet(wallet.mnemonic, { derivationPath: wallet.derivationPath });
+    
+    // Find address with sufficient balance
+    let senderAddress = null;
+    let senderPrivateKey = null;
+    const atomicAmount = mnee.toAtomicAmount(amount);
+
+    for (let i = 0; i < wallet.addresses.length; i++) {
+      const addr = wallet.addresses[i];
+      try {
+        const bal = await mnee.balance(addr.address);
+        const balAtomic = parseInt(bal.amount || 0, 10);
+        if (balAtomic >= atomicAmount) {
+          const derived = hdWallet.deriveAddress(i, false);
+          senderAddress = addr.address;
+          senderPrivateKey = derived.privateKey;
+          break;
+        }
+      } catch {}
+    }
+
+    if (!senderAddress || !senderPrivateKey) {
+      return fail(`Insufficient MNEE balance. Need ${amount} MNEE.`);
+    }
+
+    // Perform the transfer
+    const response = await mnee.transfer(
+      [{ address: toAddress, amount }],
+      senderPrivateKey,
+      { broadcast: true }
+    );
+
+    ok({
+      sent: true,
+      amount,
+      unit: 'MNEE',
+      to: toAddress,
+      from: senderAddress,
+      ticketId: response.ticketId,
+      txid: response.txid || null,
+      environment: MNEE_ENVIRONMENT,
+    });
+  } catch (err) {
+    fail(`MNEE transfer failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/**
+ * Get/set wallet currency preference.
+ */
+async function cmdWalletPreference(currency) {
+  if (!currency) {
+    // Get current preference
+    const pref = loadWalletPreference();
+    return ok({
+      currency: pref,
+      note: 'Use "wallet-preference bsv" or "wallet-preference mnee" to change.',
+    });
+  }
+
+  const normalized = currency.toLowerCase();
+  if (normalized !== 'bsv' && normalized !== 'mnee') {
+    return fail('Currency must be "bsv" or "mnee"');
+  }
+
+  if (normalized === 'mnee' && !Mnee) {
+    return fail('MNEE SDK not available. Install it first: npm install @mnee/ts-sdk');
+  }
+
+  if (normalized === 'mnee') {
+    const wallet = loadMneeWallet();
+    if (!wallet) {
+      return fail('MNEE wallet not initialized. Run: mnee-setup first.');
+    }
+  }
+
+  saveWalletPreference(normalized);
+  ok({
+    currency: normalized,
+    message: `Default payment currency set to ${normalized.toUpperCase()}`,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// MNEE Payment Functions
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a direct MNEE payment to a recipient.
+ * @param {string} recipientAddress - MNEE address to pay
+ * @param {number} amount - Amount in MNEE (decimal)
+ * @param {string} desc - Payment description
+ * @returns {Promise<Object>} - Payment result with txid
+ */
+async function buildMneePayment(recipientAddress, amount, desc) {
+  if (!Mnee) {
+    throw new Error('MNEE SDK not available');
+  }
+
+  const wallet = loadMneeWallet();
+  if (!wallet) {
+    throw new Error('MNEE wallet not initialized. Run: mnee-setup');
+  }
+
+  const mnee = initMneeSdk();
+  if (!mnee) {
+    throw new Error('Failed to initialize MNEE SDK');
+  }
+
+  const hdWallet = mnee.HDWallet(wallet.mnemonic, { derivationPath: wallet.derivationPath });
+  const atomicAmount = mnee.toAtomicAmount(amount);
+
+  // Find address with sufficient balance
+  let senderAddress = null;
+  let senderPrivateKey = null;
+
+  for (let i = 0; i < wallet.addresses.length; i++) {
+    const addr = wallet.addresses[i];
+    try {
+      const bal = await mnee.balance(addr.address);
+      const balAtomic = parseInt(bal.amount || 0, 10);
+      if (balAtomic >= atomicAmount) {
+        const derived = hdWallet.deriveAddress(i, false);
+        senderAddress = addr.address;
+        senderPrivateKey = derived.privateKey;
+        break;
+      }
+    } catch {}
+  }
+
+  if (!senderAddress || !senderPrivateKey) {
+    throw new Error(`Insufficient MNEE balance. Need ${amount} MNEE.`);
+  }
+
+  // Perform the transfer
+  const response = await mnee.transfer(
+    [{ address: recipientAddress, amount }],
+    senderPrivateKey,
+    { broadcast: true }
+  );
+
+  return {
+    txid: response.txid || response.ticketId,
+    ticketId: response.ticketId,
+    amount,
+    atomicAmount,
+    from: senderAddress,
+    to: recipientAddress,
+    description: desc,
+    currency: 'mnee',
+  };
+}
+
+/**
+ * Verify and accept an MNEE payment.
+ * @param {Object} payment - Payment object with mnee-specific fields
+ * @param {number} minMnee - Minimum required MNEE amount
+ * @param {string} senderKey - Sender's identity key
+ * @param {string} serviceId - Service identifier
+ * @returns {Promise<Object>} - Verification result
+ */
+async function verifyAndAcceptMneePayment(payment, minMnee, senderKey, serviceId) {
+  const result = {
+    accepted: false,
+    txid: null,
+    amount: 0,
+    atomicAmount: 0,
+    currency: 'mnee',
+    walletAccepted: false,
+    error: null,
+  };
+
+  if (!Mnee) {
+    result.error = 'MNEE SDK not available';
+    return result;
+  }
+
+  if (!payment || !payment.txid) {
+    result.error = 'no MNEE payment';
+    return result;
+  }
+
+  const mnee = initMneeSdk();
+  if (!mnee) {
+    result.error = 'Failed to initialize MNEE SDK';
+    return result;
+  }
+
+  try {
+    // Verify the transaction status
+    const status = await mnee.getTxStatus(payment.ticketId || payment.txid);
+    
+    if (!status || status.status === 'failed') {
+      result.error = 'MNEE transaction failed or not found';
+      return result;
+    }
+
+    // Verify amount
+    const receivedAmount = parseFloat(payment.amount || 0);
+    if (receivedAmount < minMnee) {
+      result.error = `underpaid: ${receivedAmount} MNEE < ${minMnee} MNEE`;
+      return result;
+    }
+
+    result.txid = payment.txid || payment.ticketId;
+    result.amount = receivedAmount;
+    result.atomicAmount = payment.atomicAmount || mnee.toAtomicAmount(receivedAmount);
+    result.accepted = true;
+    result.walletAccepted = true;
+
+    // Log received payment
+    const paymentLogPath = path.join(MNEE_WALLET_DIR, 'received-payments.jsonl');
+    try {
+      fs.mkdirSync(MNEE_WALLET_DIR, { recursive: true });
+      const entry = {
+        txid: result.txid,
+        amount: result.amount,
+        atomicAmount: result.atomicAmount,
+        serviceId,
+        from: senderKey,
+        ts: Date.now(),
+      };
+      fs.appendFileSync(paymentLogPath, JSON.stringify(entry) + '\n');
+    } catch {}
+
+    return result;
+  } catch (err) {
+    result.error = `MNEE verification failed: ${err instanceof Error ? err.message : String(err)}`;
+    return result;
+  }
+}
+
+/**
+ * Unified payment verification that handles both BSV and MNEE.
+ * @param {Object} payment - Payment object (can be BSV BEEF or MNEE)
+ * @param {number} minSats - Minimum required satoshis (for BSV)
+ * @param {number} minMnee - Minimum required MNEE (for MNEE)
+ * @param {string} senderKey - Sender's identity key  
+ * @param {string} serviceId - Service identifier
+ * @param {Uint8Array} recipientHash160 - Recipient's BSV pubkey hash
+ * @returns {Promise<Object>} - Verification result
+ */
+async function verifyAndAcceptDualCurrencyPayment(payment, minSats, minMnee, senderKey, serviceId, recipientHash160) {
+  // Determine payment type
+  if (payment && payment.currency === 'mnee') {
+    return await verifyAndAcceptMneePayment(payment, minMnee, senderKey, serviceId);
+  }
+  
+  // Default to BSV payment verification
+  return await verifyAndAcceptPayment(payment, minSats, senderKey, serviceId, recipientHash160);
 }
 
 // ---------------------------------------------------------------------------
@@ -3998,8 +4629,16 @@ try {
     case 'research-respond':  await cmdResearchRespond(args[0]); break;
     case 'research-queue':    await cmdResearchQueue(); break;
 
+    // MNEE Stablecoin commands
+    case 'mnee-setup':        await cmdMneeSetup(); break;
+    case 'mnee-address':      await cmdMneeAddress(); break;
+    case 'mnee-new-address':  await cmdMneeNewAddress(); break;
+    case 'mnee-balance':      await cmdMneeBalance(); break;
+    case 'mnee-send':         await cmdMneeSend(args[0], args[1]); break;
+    case 'wallet-preference': await cmdWalletPreference(args[0]); break;
+
     default:
-      fail(`Unknown command: ${command || '(none)'}. Commands: setup, identity, address, balance, import, refund, register, unregister, services, advertise, remove, discover, pay, verify, accept, send, inbox, ack, poll, connect, request-service, research-queue, research-respond`);
+      fail(`Unknown command: ${command || '(none)'}. Commands: setup, identity, address, balance, import, refund, register, unregister, services, advertise, remove, discover, pay, verify, accept, send, inbox, ack, poll, connect, request-service, research-queue, research-respond, mnee-setup, mnee-address, mnee-new-address, mnee-balance, mnee-send, wallet-preference`);
   }
 } catch (err) {
   fail(err instanceof Error ? err.message : String(err));
