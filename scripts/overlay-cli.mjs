@@ -661,8 +661,14 @@ async function buildWalletCreateActionTx(payload, topic, identity) {
   }
 }
 
-/** Synthetic (unfunded) transaction — works only with SCRIPTS_ONLY overlay */
+/** Synthetic (unfunded) transaction — works only with SCRIPTS_ONLY overlay.
+ *  Issue #6: Blocked on mainnet unless ALLOW_SYNTHETIC=true env var is set. */
 function buildSyntheticTx(payload, privKey, pubKey) {
+  // Guard: never use synthetic funding on mainnet without explicit opt-in
+  if (NETWORK === 'mainnet' && process.env.ALLOW_SYNTHETIC !== 'true') {
+    throw new Error('No funds available. Import a UTXO first: overlay-cli import <txid>');
+  }
+  console.error(`[buildSyntheticTx] WARNING: Using synthetic (fabricated) funding on ${NETWORK}. This creates fake merkle proofs.`);
   const pubKeyHashHex = pubKey.toHash('hex');
   const pubKeyHash = [];
   for (let i = 0; i < pubKeyHashHex.length; i += 2) {
@@ -935,6 +941,11 @@ async function cmdSetup() {
   const wallet = await BSVAgentWallet.create({ network: NETWORK, storageDir: WALLET_DIR });
   const identityKey = await wallet.getIdentityKey();
   await wallet.destroy();
+  // Issue #8: Restrict permissions on wallet-identity.json (contains private key)
+  const newIdentityPath = path.join(WALLET_DIR, 'wallet-identity.json');
+  if (fs.existsSync(newIdentityPath)) {
+    fs.chmodSync(newIdentityPath, 0o600);
+  }
   ok({
     identityKey,
     walletDir: WALLET_DIR,
@@ -1688,6 +1699,13 @@ function loadIdentity() {
   if (!fs.existsSync(identityPath)) {
     throw new Error('Wallet not initialized. Run: overlay-cli setup');
   }
+  // Issue #8: Warn if wallet identity file has overly permissive mode
+  try {
+    const fileMode = fs.statSync(identityPath).mode & 0o777;
+    if (fileMode & 0o044) { // world or group readable
+      console.error(`[security] WARNING: ${identityPath} has permissive mode 0${fileMode.toString(8)}. Run: chmod 600 ${identityPath}`);
+    }
+  } catch {}
   const identity = JSON.parse(fs.readFileSync(identityPath, 'utf-8'));
   const privKey = PrivateKey.fromHex(identity.rootKeyHex);
   return { identityKey: identity.identityKey, privKey };
@@ -1974,6 +1992,18 @@ async function processMessage(msg, identityKey, privKey) {
     ? verifyRelaySignature(msg.from, msg.to, msg.type, msg.payload, msg.signature)
     : { valid: null };
 
+  // Issue #7: Enforce signature verification — reject unsigned/forged messages
+  // Pings are harmless; service-requests and other types must have valid signatures
+  if (msg.type === 'service-request' && sigCheck.valid !== true) {
+    console.error(JSON.stringify({ event: 'signature-rejected', type: msg.type, from: msg.from, reason: sigCheck.reason || 'missing signature' }));
+    return {
+      id: msg.id, type: msg.type, from: msg.from,
+      action: 'rejected', reason: 'invalid-signature',
+      signatureValid: sigCheck.valid,
+      ack: true,
+    };
+  }
+
   if (msg.type === 'ping') {
     // Auto-respond with pong
     const pongPayload = {
@@ -2132,19 +2162,28 @@ async function performCodeReview(input) {
     if (!match) return { type: 'code-review', error: 'Invalid PR URL format. Expected: https://github.com/owner/repo/pull/123' };
     const [, owner, repo, prNumber] = match;
 
-    const { execSync } = await import('child_process');
+    // Strict validation of owner/repo to prevent shell injection (Issue #4)
+    const safeNameRegex = /^[a-zA-Z0-9._-]+$/;
+    if (!safeNameRegex.test(owner) || !safeNameRegex.test(repo)) {
+      return { type: 'code-review', error: 'Invalid owner/repo name — only alphanumeric, dots, hyphens, and underscores allowed' };
+    }
+    if (!/^\d+$/.test(prNumber)) {
+      return { type: 'code-review', error: 'Invalid PR number — must be numeric' };
+    }
+
+    const { execFileSync } = await import('child_process');
     let prInfo, prDiff;
     try {
-      prInfo = JSON.parse(execSync(
-        `gh pr view ${prNumber} --repo ${owner}/${repo} --json title,body,additions,deletions,files,author`,
+      prInfo = JSON.parse(execFileSync(
+        'gh', ['pr', 'view', prNumber, '--repo', `${owner}/${repo}`, '--json', 'title,body,additions,deletions,files,author'],
         { encoding: 'utf-8', timeout: 30000 },
       ));
     } catch (e) {
       return { type: 'code-review', error: `Failed to fetch PR metadata: ${e.message}` };
     }
     try {
-      prDiff = execSync(
-        `gh pr diff ${prNumber} --repo ${owner}/${repo}`,
+      prDiff = execFileSync(
+        'gh', ['pr', 'diff', prNumber, '--repo', `${owner}/${repo}`],
         { encoding: 'utf-8', maxBuffer: 2 * 1024 * 1024, timeout: 30000 },
       );
     } catch (e) {
@@ -2155,7 +2194,6 @@ async function performCodeReview(input) {
 
     // Post the review as a comment on the GitHub PR
     try {
-      const { execSync: exec2 } = await import('child_process');
       // Group findings by severity
       const bySeverity = { critical: [], high: [], warning: [], info: [] };
       for (const f of review.findings) {
@@ -2221,11 +2259,11 @@ async function performCodeReview(input) {
         `_Reviewed by [BSV Overlay Skill](https://github.com/galt-tr/bsv-overlay-skill) · Paid via BSV micropayment (50 sats)_`,
       ].join('\n');
 
-      // Write comment to temp file to avoid shell escaping issues
+      // Write comment to temp file to avoid shell escaping issues (Issue #4: --body-file)
       const tmpFile = path.join(os.tmpdir(), `cr-${Date.now()}.md`);
       fs.writeFileSync(tmpFile, commentBody, 'utf-8');
-      exec2(
-        `gh pr comment ${prNumber} --repo ${owner}/${repo} --body-file ${tmpFile}`,
+      execFileSync(
+        'gh', ['pr', 'comment', prNumber, '--repo', `${owner}/${repo}`, '--body-file', tmpFile],
         { encoding: 'utf-8', timeout: 15000 },
       );
       try { fs.unlinkSync(tmpFile); } catch {} // cleanup
