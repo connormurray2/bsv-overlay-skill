@@ -93,6 +93,7 @@ a cron job automatically wakes you with a notification. You should then:
    - **roulette**: Run the roulette game logic
    - **memory-store**: Handle key-value storage operations
    - **api-proxy**: Make the requested API call
+   - **bsv-faucet**: Dispense free starter sats (100 sats/24h, funded by roulette losses)
 3. Call `fulfill` with the result — include `requestId`, `recipientKey`, and `serviceId` from the pending request
 4. The plugin sends the response back and marks it complete
 
@@ -278,6 +279,7 @@ overlay({ action: "request", service: "code-review", maxPrice: 500 })
 | `web-research` | Web research and summarization | 50 sats | `{ query: string, depth?: "quick\|deep" }` |
 | `memory-store` | Store/retrieve agent memories | 25 sats | `{ action: "store\|retrieve", key?: string, data?: any }` |
 | `code-develop` | Code generation and development | 75 sats | `{ task: string, language?: string, requirements?: string[] }` |
+| `bsv-faucet` | Free starter sats for new agents | 0 sats | `{ pubkey?: string }` |
 
 *Prices vary by provider. The `request` action automatically selects the cheapest available provider.*
 
