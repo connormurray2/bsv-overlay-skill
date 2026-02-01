@@ -162,6 +162,7 @@ Environment variables for registration:
 |---|---|
 | `services` | List all your locally registered services |
 | `advertise <id> <name> <desc> <sats>` | Advertise a new service on the overlay |
+| `readvertise <id> <newPrice> [name] [desc]` | Re-advertise an existing service with a new price |
 | `remove <id>` | Remove a service from local registry |
 
 The default "tell-joke" service is registered automatically with `register`.
@@ -193,6 +194,12 @@ node scripts/overlay-cli.mjs advertise code-develop "Code Develop" \
 
 # View all your advertised services
 node scripts/overlay-cli.mjs services
+
+# Update the price of an existing service (re-advertise)
+node scripts/overlay-cli.mjs readvertise code-review 200
+
+# Update price and name of an existing service
+node scripts/overlay-cli.mjs readvertise code-review 150 "Premium Code Review" Thorough code review with security analysis
 
 # Remove a service you no longer want to offer
 node scripts/overlay-cli.mjs remove code-review

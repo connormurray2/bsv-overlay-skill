@@ -24,6 +24,7 @@
  *   unregister                                         — (future) Remove from overlay
  *   services                                           — List my advertised services
  *   advertise <serviceId> <name> <desc> <priceSats>    — Add a service to overlay
+ *   readvertise <serviceId> <newPrice> [name] [desc]   — Re-advertise service with new price
  *   remove <serviceId>                                 — Remove a service (future)
  *   discover [--service <type>] [--agent <name>]       — Find agents/services on overlay
  *   pay <identityKey> <sats> [description]             — Pay another agent
@@ -1611,6 +1612,61 @@ async function cmdRemove(serviceId) {
     serviceId,
     note: 'Removed from local registry. On-chain record remains until UTXO is spent.',
     previousTxid: removed.txid,
+  });
+}
+
+async function cmdReadvertise(serviceId, newPrice, newName, newDesc) {
+  if (!serviceId || !newPrice) {
+    return fail('Usage: readvertise <serviceId> <newPrice> [newName] [newDesc]');
+  }
+
+  const identityPath = path.join(WALLET_DIR, 'wallet-identity.json');
+  if (!fs.existsSync(identityPath)) return fail('Wallet not initialized. Run: overlay-cli setup');
+
+  const identity = JSON.parse(fs.readFileSync(identityPath, 'utf-8'));
+  const sats = parseInt(newPrice, 10);
+  if (isNaN(sats) || sats < 0) return fail('newPrice must be a non-negative integer (satoshis)');
+
+  // Load existing service
+  const services = loadServices();
+  const existing = services.find(s => s.serviceId === serviceId);
+  if (!existing) return fail(`Service '${serviceId}' not found in local registry. Use 'advertise' to create it first.`);
+
+  const name = newName || existing.name;
+  const description = newDesc || existing.description;
+
+  const servicePayload = {
+    protocol: PROTOCOL_ID,
+    type: 'service',
+    identityKey: identity.identityKey,
+    serviceId,
+    name,
+    description,
+    pricing: { model: 'per-task', amountSats: sats },
+    timestamp: new Date().toISOString(),
+  };
+
+  let result;
+  try {
+    result = await buildRealOverlayTransaction(servicePayload, TOPICS.SERVICES);
+  } catch (err) {
+    return fail(`Readvertise failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  // Update local services list
+  const idx = services.findIndex(s => s.serviceId === serviceId);
+  services[idx] = {
+    serviceId, name, description, priceSats: sats,
+    txid: result.txid,
+    registeredAt: new Date().toISOString(),
+  };
+  saveServices(services);
+
+  ok({
+    readvertised: true,
+    serviceId, name, description, priceSats: sats,
+    txid: result.txid,
+    funded: result.funded,
   });
 }
 
@@ -4311,6 +4367,7 @@ try {
     case 'services':    await cmdServices(); break;
     case 'advertise':   await cmdAdvertise(args[0], args[1], args[2], args[3]); break;
     case 'remove':      await cmdRemove(args[0]); break;
+    case 'readvertise': await cmdReadvertise(args[0], args[1], args[2], args.slice(3).join(' ') || undefined); break;
 
     // Discovery
     case 'discover':    await cmdDiscover(args); break;
@@ -4331,7 +4388,7 @@ try {
     case 'research-queue':    await cmdResearchQueue(); break;
 
     default:
-      fail(`Unknown command: ${command || '(none)'}. Commands: setup, identity, address, balance, import, refund, register, unregister, services, advertise, remove, discover, pay, verify, accept, send, inbox, ack, poll, connect, request-service, research-queue, research-respond`);
+      fail(`Unknown command: ${command || '(none)'}. Commands: setup, identity, address, balance, import, refund, register, unregister, services, advertise, readvertise, remove, discover, pay, verify, accept, send, inbox, ack, poll, connect, request-service, research-queue, research-respond`);
   }
 } catch (err) {
   fail(err instanceof Error ? err.message : String(err));
