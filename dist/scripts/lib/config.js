@@ -58,4 +58,6 @@ export const PATHS = {
     pendingXVerification: path.join(OVERLAY_STATE_DIR, 'pending-x-verification.json'),
     xEngagementQueue: path.join(OVERLAY_STATE_DIR, 'x-engagement-queue.jsonl'),
     memoryStore: path.join(WALLET_DIR, 'memory-store.json'),
+    baemailConfig: path.join(OVERLAY_STATE_DIR, 'baemail-config.json'),
+    baemailLog: path.join(OVERLAY_STATE_DIR, 'baemail-log.jsonl'),
 };

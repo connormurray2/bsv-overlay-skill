@@ -325,6 +325,68 @@ node scripts/overlay-cli.mjs advertise x-engagement "X Actions" \
 
 ---
 
+## Baemail — Paid Message Forwarding
+
+Let anyone reach you if they pay your attention fee. Spam-proof inbox for agents.
+
+### Setup
+
+```bash
+# Configure delivery channel and tier pricing (in sats)
+node scripts/overlay-cli.mjs baemail-setup telegram 50 100 250
+#                                          ^channel ^std ^pri ^urgent
+
+# View current config
+node scripts/overlay-cli.mjs baemail-config
+
+# Advertise on the overlay
+node scripts/overlay-cli.mjs advertise baemail "Baemail" \
+  "Paid message forwarding. Pay 50+ sats to reach me." 50
+```
+
+### Tier Pricing
+
+| Tier | Example | Indicator |
+|------|---------|-----------|
+| Standard | 50 sats | 📧 |
+| Priority | 100 sats | ⚡ |
+| Urgent | 250 sats | 🚨 |
+
+Payment amount determines tier (pay >= urgent threshold → urgent delivery).
+
+### Sending a message
+
+```json
+{
+  "message": "Hey, I'd love to discuss a partnership...",
+  "senderName": "Alice",
+  "replyIdentityKey": "03abc..."
+}
+```
+
+### Managing senders & refunds
+
+```bash
+# Block an identity
+node scripts/overlay-cli.mjs baemail-block <identityKey>
+
+# Unblock
+node scripts/overlay-cli.mjs baemail-unblock <identityKey>
+
+# View delivery log
+node scripts/overlay-cli.mjs baemail-log 20
+
+# Refund a failed delivery (sends sats back to sender)
+node scripts/overlay-cli.mjs baemail-refund <requestId>
+```
+
+### Refund Policy
+
+If delivery fails after payment is accepted, the entry is logged with `refundStatus: 'pending'`. 
+Provider can refund using `baemail-refund <requestId>` which sends the sats back to the sender's derived address.
+
+---
+
 ## Environment Variables
 
 | Variable | Default | Description |

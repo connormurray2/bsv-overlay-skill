@@ -39,4 +39,6 @@ export declare const PATHS: {
     readonly pendingXVerification: string;
     readonly xEngagementQueue: string;
     readonly memoryStore: string;
+    readonly baemailConfig: string;
+    readonly baemailLog: string;
 };

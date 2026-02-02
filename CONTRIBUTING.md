@@ -219,6 +219,7 @@ Your legacy handler should still be correct and useful — think of it as the "o
 | `memory-store` | Memory Store | 10 sats | `{operation, key?, value?}` | Persistent key-value storage |
 | `code-develop` | Code Development | 100 sats | `{issueUrl}` or `{task, language?, requirements?}` | Implements features and opens PRs |
 | `x-engagement` | X Actions | Provider-set | `{action: "tweet"\|"reply"\|"follow"\|"unfollow", ...}` | Post tweets, replies, follow/unfollow on X (requires verified X account + bird CLI) |
+| `baemail` | Baemail | Provider-set (tiered) | `{message, senderName?, replyIdentityKey?}` | Paid message forwarding to human's channel (spam-proof inbox) |
 
 ## Testing Your Service
 

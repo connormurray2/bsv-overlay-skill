@@ -2621,6 +2621,8 @@ async function processMessage(msg, identityKey, privKey) {
       return await processCodeDevelop(msg, identityKey, privKey);
     } else if (serviceId === 'x-engagement') {
       return await processXEngagement(msg, identityKey, privKey);
+    } else if (serviceId === 'baemail') {
+      return await processBaemail(msg, identityKey, privKey);
     } else {
       // Unknown service — don't auto-process
       return {
@@ -4847,6 +4849,557 @@ async function cmdXEngagementFulfill(requestId, proofUrl) {
   });
 }
 
+
+// ---------------------------------------------------------------------------
+// Baemail Service — Paid Message Forwarding
+// ---------------------------------------------------------------------------
+
+const BAEMAIL_CONFIG_PATH = path.join(OVERLAY_STATE_DIR, 'baemail-config.json');
+
+/**
+ * Load baemail configuration.
+ */
+function loadBaemailConfig() {
+  try {
+    if (fs.existsSync(BAEMAIL_CONFIG_PATH)) {
+      return JSON.parse(fs.readFileSync(BAEMAIL_CONFIG_PATH, 'utf-8'));
+    }
+  } catch (err) {
+    console.warn(`[baemail] Warning: Could not read config: ${err.message}`);
+  }
+  return null;
+}
+
+/**
+ * Save baemail configuration.
+ */
+function saveBaemailConfig(config) {
+  fs.mkdirSync(OVERLAY_STATE_DIR, { recursive: true });
+  fs.writeFileSync(BAEMAIL_CONFIG_PATH, JSON.stringify(config, null, 2));
+}
+
+/**
+ * Setup baemail service with delivery channel and tier pricing.
+ * Usage: baemail-setup <channel> <standardSats> <prioritySats> <urgentSats>
+ */
+async function cmdBaemailSetup(channel, standardStr, priorityStr, urgentStr) {
+  if (!channel || !standardStr) {
+    return fail('Usage: baemail-setup <channel> <standardSats> [prioritySats] [urgentSats]');
+  }
+
+  const standard = parseInt(standardStr, 10);
+  const priority = priorityStr ? parseInt(priorityStr, 10) : standard * 2;
+  const urgent = urgentStr ? parseInt(urgentStr, 10) : standard * 5;
+
+  if (isNaN(standard) || standard < 1) {
+    return fail('Standard rate must be a positive integer (sats)');
+  }
+  if (priority < standard) {
+    return fail('Priority rate must be >= standard rate');
+  }
+  if (urgent < priority) {
+    return fail('Urgent rate must be >= priority rate');
+  }
+
+  const config = {
+    deliveryChannel: channel,
+    tiers: { standard, priority, urgent },
+    maxMessageLength: 4000,
+    blocklist: [],
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+
+  saveBaemailConfig(config);
+
+  ok({
+    configured: true,
+    deliveryChannel: channel,
+    tiers: config.tiers,
+    note: `Advertise with: overlay-cli advertise baemail "Baemail" "Paid message forwarding. Pay ${standard}+ sats to reach me." ${standard}`,
+  });
+}
+
+/**
+ * View current baemail configuration.
+ */
+async function cmdBaemailConfig() {
+  const config = loadBaemailConfig();
+  if (!config) {
+    return fail('Baemail not configured. Run: baemail-setup <channel> <standardSats> [prioritySats] [urgentSats]');
+  }
+  ok(config);
+}
+
+/**
+ * Block a sender from using baemail.
+ */
+async function cmdBaemailBlock(identityKey) {
+  if (!identityKey) return fail('Usage: baemail-block <identityKey>');
+
+  const config = loadBaemailConfig();
+  if (!config) {
+    return fail('Baemail not configured. Run baemail-setup first.');
+  }
+
+  if (!config.blocklist) config.blocklist = [];
+  if (config.blocklist.includes(identityKey)) {
+    return fail('Identity already blocked');
+  }
+
+  config.blocklist.push(identityKey);
+  config.updatedAt = new Date().toISOString();
+  saveBaemailConfig(config);
+
+  ok({ blocked: identityKey, totalBlocked: config.blocklist.length });
+}
+
+/**
+ * Unblock a sender.
+ */
+async function cmdBaemailUnblock(identityKey) {
+  if (!identityKey) return fail('Usage: baemail-unblock <identityKey>');
+
+  const config = loadBaemailConfig();
+  if (!config) {
+    return fail('Baemail not configured. Run baemail-setup first.');
+  }
+
+  if (!config.blocklist || !config.blocklist.includes(identityKey)) {
+    return fail('Identity not in blocklist');
+  }
+
+  config.blocklist = config.blocklist.filter(k => k !== identityKey);
+  config.updatedAt = new Date().toISOString();
+  saveBaemailConfig(config);
+
+  ok({ unblocked: identityKey, totalBlocked: config.blocklist.length });
+}
+
+/**
+ * Process incoming baemail service request.
+ * Validates payment, determines tier, forwards to configured channel.
+ */
+async function processBaemail(msg, identityKey, privKey) {
+  const input = msg.payload?.input || msg.payload;
+  const payment = msg.payload?.payment;
+
+  // Load config
+  const config = loadBaemailConfig();
+  if (!config) {
+    const rejectPayload = {
+      requestId: msg.id,
+      serviceId: 'baemail',
+      status: 'rejected',
+      reason: 'Baemail service not configured on this agent.',
+    };
+    const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+    await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
+    });
+    return { id: msg.id, type: 'service-request', serviceId: 'baemail', action: 'rejected', reason: 'not configured', from: msg.from, ack: true };
+  }
+
+  // Check blocklist
+  if (config.blocklist && config.blocklist.includes(msg.from)) {
+    const rejectPayload = {
+      requestId: msg.id,
+      serviceId: 'baemail',
+      status: 'rejected',
+      reason: 'Sender is blocked.',
+    };
+    const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+    await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
+    });
+    return { id: msg.id, type: 'service-request', serviceId: 'baemail', action: 'rejected', reason: 'blocked', from: msg.from, ack: true };
+  }
+
+  // Validate message
+  const message = input?.message;
+  if (!message || typeof message !== 'string' || message.trim().length === 0) {
+    const rejectPayload = {
+      requestId: msg.id,
+      serviceId: 'baemail',
+      status: 'rejected',
+      reason: 'Missing or empty message. Send {message: "your message"}',
+    };
+    const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+    await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
+    });
+    return { id: msg.id, type: 'service-request', serviceId: 'baemail', action: 'rejected', reason: 'missing message', from: msg.from, ack: true };
+  }
+
+  if (message.length > (config.maxMessageLength || 4000)) {
+    const rejectPayload = {
+      requestId: msg.id,
+      serviceId: 'baemail',
+      status: 'rejected',
+      reason: `Message too long. Max ${config.maxMessageLength || 4000} characters.`,
+    };
+    const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+    await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
+    });
+    return { id: msg.id, type: 'service-request', serviceId: 'baemail', action: 'rejected', reason: 'message too long', from: msg.from, ack: true };
+  }
+
+  // Load wallet identity for payment verification
+  let walletIdentity;
+  try {
+    walletIdentity = JSON.parse(fs.readFileSync(path.join(WALLET_DIR, 'wallet-identity.json'), 'utf-8'));
+  } catch (err) {
+    const rejectPayload = {
+      requestId: msg.id,
+      serviceId: 'baemail',
+      status: 'rejected',
+      reason: 'Service temporarily unavailable (wallet error)',
+    };
+    const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+    await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
+    });
+    return { id: msg.id, type: 'service-request', serviceId: 'baemail', action: 'rejected', reason: 'wallet error', from: msg.from, ack: true };
+  }
+
+  // Sender info for message formatting
+  const senderName = input?.senderName || 'Anonymous';
+  const replyKey = input?.replyIdentityKey || msg.from;
+
+  // Check hooks are configured (but don't pre-test - avoids race condition)
+  let hookToken = null;
+  let hookPort = 18789;
+  const openclawConfigPath = path.join(os.homedir(), '.openclaw', 'openclaw.json');
+  
+  if (fs.existsSync(openclawConfigPath)) {
+    try {
+      const openclawConfig = JSON.parse(fs.readFileSync(openclawConfigPath, 'utf-8'));
+      hookToken = openclawConfig?.hooks?.token;
+      hookPort = openclawConfig?.gateway?.port || 18789;
+    } catch (parseErr) {
+      console.warn('[baemail] Failed to parse OpenClaw config:', parseErr.message);
+    }
+  }
+
+  if (!hookToken) {
+    const rejectPayload = {
+      requestId: msg.id,
+      serviceId: 'baemail',
+      status: 'rejected',
+      reason: 'OpenClaw hooks not configured. Payment NOT accepted.',
+    };
+    const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+    await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
+    });
+    return { id: msg.id, type: 'service-request', serviceId: 'baemail', action: 'rejected', reason: 'hooks not configured', from: msg.from, ack: true };
+  }
+
+  // Verify and accept payment
+  const ourHash160 = Hash.hash160(PrivateKey.fromHex(walletIdentity.rootKeyHex).toPublicKey().encode(true));
+  const minPrice = config.tiers.standard;
+  
+  const payResult = await verifyAndAcceptPayment(payment, minPrice, msg.from, 'baemail', ourHash160);
+
+  if (!payResult.accepted) {
+    const rejectPayload = {
+      requestId: msg.id,
+      serviceId: 'baemail',
+      status: 'rejected',
+      reason: `Payment rejected: ${payResult.error}. Minimum: ${minPrice} sats.`,
+    };
+    const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+    await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
+    });
+    return { id: msg.id, type: 'service-request', serviceId: 'baemail', action: 'rejected', reason: payResult.error, from: msg.from, ack: true };
+  }
+
+  // Determine tier based on payment amount
+  const paidSats = payResult.satoshis;
+  let tier = 'standard';
+  let tierEmoji = '📧';
+  if (paidSats >= config.tiers.urgent) {
+    tier = 'urgent';
+    tierEmoji = '🚨';
+  } else if (paidSats >= config.tiers.priority) {
+    tier = 'priority';
+    tierEmoji = '⚡';
+  }
+
+  // Format and deliver the message
+  const formattedMessage = `${tierEmoji} **Baemail** (${tier.toUpperCase()})
+
+**From:** ${senderName}
+**Paid:** ${paidSats} sats
+**Reply to:** \`${replyKey.slice(0, 16)}...\`
+
+---
+
+${message}
+
+---
+_Reply via overlay: \`overlay-cli send ${replyKey} ping "your reply"\`_`;
+
+  let deliverySuccess = false;
+  let deliveryError = null;
+
+  try {
+    const hookHost = process.env.CLAWDBOT_HOST || process.env.OPENCLAW_HOST || '127.0.0.1';
+    const hookUrl = `http://${hookHost}:${hookPort}/hooks/agent`;
+    const hookResp = await fetchWithTimeout(hookUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${hookToken}`,
+        'x-clawdbot-token': hookToken,
+      },
+      body: JSON.stringify({
+        message: formattedMessage,
+        name: 'Baemail',
+        sessionKey: `baemail:${msg.id}`,
+        wakeMode: 'now',
+        deliver: true,
+        channel: config.deliveryChannel,
+      }),
+    });
+
+    if (hookResp.ok) {
+      deliverySuccess = true;
+    } else {
+      const body = await hookResp.text().catch(() => '');
+      deliveryError = `Hook failed: ${hookResp.status} ${body}`;
+    }
+  } catch (err) {
+    deliveryError = err.message;
+  }
+
+  // Log the delivery attempt (with refund status if failed)
+  const logPath = path.join(OVERLAY_STATE_DIR, 'baemail-log.jsonl');
+  const logEntry = {
+    requestId: msg.id,
+    from: msg.from,
+    senderName,
+    tier,
+    paidSats,
+    messageLength: message.length,
+    deliveryChannel: config.deliveryChannel,
+    deliverySuccess,
+    deliveryError,
+    paymentTxid: payResult.txid,
+    refundStatus: deliverySuccess ? null : 'pending',
+    timestamp: new Date().toISOString(),
+  };
+  fs.appendFileSync(logPath, JSON.stringify(logEntry) + '\n');
+
+  // Send response - status reflects ACTUAL delivery result
+  const responsePayload = {
+    requestId: msg.id,
+    serviceId: 'baemail',
+    status: deliverySuccess ? 'fulfilled' : 'delivery_failed',
+    result: {
+      delivered: deliverySuccess,
+      tier,
+      channel: config.deliveryChannel,
+      paidSats,
+      error: deliveryError,
+      replyTo: identityKey,
+      refundable: !deliverySuccess,
+      note: deliverySuccess ? undefined : 'Delivery failed. Run: baemail-refund ' + msg.id,
+    },
+    paymentAccepted: true,
+    paymentTxid: payResult.txid,
+    satoshisReceived: payResult.satoshis,
+  };
+
+  const respSig = signRelayMessage(privKey, msg.from, 'service-response', responsePayload);
+  await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: responsePayload, signature: respSig }),
+  });
+
+  return {
+    id: msg.id, type: 'service-request', serviceId: 'baemail',
+    action: deliverySuccess ? 'fulfilled' : 'delivery_failed',
+    tier,
+    deliverySuccess,
+    deliveryError,
+    paymentAccepted: true, paymentTxid: payResult.txid,
+    satoshisReceived: payResult.satoshis,
+    from: msg.from, ack: true,
+  };
+}
+
+/**
+ * View baemail delivery log.
+ */
+async function cmdBaemailLog(limitStr) {
+  const limit = parseInt(limitStr, 10) || 20;
+  const logPath = path.join(OVERLAY_STATE_DIR, 'baemail-log.jsonl');
+  
+  if (!fs.existsSync(logPath)) {
+    return ok({ log: [], count: 0 });
+  }
+
+  const lines = fs.readFileSync(logPath, 'utf-8').split('\n').filter(l => l.trim());
+  const entries = lines.map(l => {
+    try { return JSON.parse(l); } catch { return null; }
+  }).filter(Boolean);
+
+  const recent = entries.slice(-limit).reverse();
+  ok({ log: recent, count: entries.length, showing: recent.length });
+}
+
+/**
+ * Refund a failed baemail delivery.
+ * Sends the received sats back to the sender.
+ */
+async function cmdBaemailRefund(requestId) {
+  if (!requestId) return fail('Usage: baemail-refund <requestId>');
+
+  const logPath = path.join(OVERLAY_STATE_DIR, 'baemail-log.jsonl');
+  if (!fs.existsSync(logPath)) {
+    return fail('No baemail log found');
+  }
+
+  // Find the entry
+  const lines = fs.readFileSync(logPath, 'utf-8').split('\n').filter(l => l.trim());
+  const entries = lines.map((l, idx) => {
+    try { return { ...JSON.parse(l), _lineIdx: idx }; } catch { return null; }
+  }).filter(Boolean);
+
+  const entry = entries.find(e => e.requestId === requestId);
+  if (!entry) {
+    return fail(`Request ${requestId} not found in baemail log`);
+  }
+
+  if (entry.deliverySuccess) {
+    return fail('This delivery was successful — no refund needed');
+  }
+
+  if (entry.refundStatus === 'completed') {
+    return fail('Refund already processed for this request');
+  }
+
+  // Load wallet
+  const { identityKey, privKey } = loadIdentity();
+  const walletIdentity = JSON.parse(fs.readFileSync(path.join(WALLET_DIR, 'wallet-identity.json'), 'utf-8'));
+
+  // Calculate refund amount (same as received, minus small tx fee)
+  const refundSats = entry.paidSats - 1; // Keep 1 sat for tx fee
+  if (refundSats < 1) {
+    return fail('Amount too small to refund');
+  }
+
+  // Derive refund address from sender's identity key (BRC-29 style)
+  const senderPubKey = PublicKey.fromString(entry.from);
+  const refundAddress = senderPubKey.toAddress().toString();
+
+  // Create and broadcast refund transaction
+  try {
+    // Load UTXOs
+    const address = walletIdentity.address;
+    const utxosResp = await fetchWithTimeout(`https://api.whatsonchain.com/v1/bsv/main/address/${address}/unspent`);
+    const utxos = await utxosResp.json();
+
+    if (!utxos || utxos.length === 0) {
+      return fail('No UTXOs available for refund');
+    }
+
+    // Build transaction
+    const tx = new Transaction();
+    let totalInput = 0;
+    const rootKey = PrivateKey.fromHex(walletIdentity.rootKeyHex);
+
+    for (const utxo of utxos) {
+      if (totalInput >= refundSats + 50) break; // enough for refund + fee buffer
+      tx.addInput({
+        sourceTXID: utxo.tx_hash,
+        sourceOutputIndex: utxo.tx_pos,
+        sourceSatoshis: utxo.value,
+        script: new P2PKH().lock(rootKey.toPublicKey().toAddress()).toHex(),
+        unlockingScriptTemplate: new P2PKH().unlock(rootKey),
+      });
+      totalInput += utxo.value;
+    }
+
+    if (totalInput < refundSats + 10) {
+      return fail('Insufficient funds for refund');
+    }
+
+    // Refund output
+    tx.addOutput({
+      satoshis: refundSats,
+      lockingScript: new P2PKH().lock(refundAddress),
+    });
+
+    // Change output (if any)
+    const fee = 10;
+    const change = totalInput - refundSats - fee;
+    if (change > 1) {
+      tx.addOutput({
+        satoshis: change,
+        lockingScript: new P2PKH().lock(rootKey.toPublicKey().toAddress()),
+      });
+    }
+
+    await tx.sign();
+
+    // Broadcast via WoC
+    const beef = tx.toHexBEEF();
+    const broadcastResp = await fetchWithTimeout('https://api.whatsonchain.com/v1/bsv/main/tx/raw', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ txhex: tx.toHex() }),
+    });
+
+    if (!broadcastResp.ok) {
+      const errBody = await broadcastResp.text();
+      return fail(`Broadcast failed: ${errBody}`);
+    }
+
+    const txid = tx.id('hex');
+
+    // Update log entry
+    const updatedLines = lines.map((l, idx) => {
+      if (idx === entry._lineIdx) {
+        const updated = { ...JSON.parse(l), refundStatus: 'completed', refundTxid: txid, refundedAt: new Date().toISOString() };
+        return JSON.stringify(updated);
+      }
+      return l;
+    });
+    fs.writeFileSync(logPath, updatedLines.join('\n') + '\n');
+
+    ok({
+      refunded: true,
+      requestId,
+      refundSats,
+      refundAddress,
+      txid,
+      note: `Refunded ${refundSats} sats to sender`,
+    });
+
+  } catch (err) {
+    return fail(`Refund failed: ${err.message}`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Poll command — uses shared processMessage
 // ---------------------------------------------------------------------------
@@ -5287,6 +5840,14 @@ try {
     // X Engagement Service
     case 'x-engagement-queue':    await cmdXEngagementQueue(); break;
     case 'x-engagement-fulfill':  await cmdXEngagementFulfill(args[0], args[1]); break;
+
+    // Baemail commands
+    case 'baemail-setup':   await cmdBaemailSetup(args[0], args[1], args[2], args[3]); break;
+    case 'baemail-config':  await cmdBaemailConfig(); break;
+    case 'baemail-block':   await cmdBaemailBlock(args[0]); break;
+    case 'baemail-unblock': await cmdBaemailUnblock(args[0]); break;
+    case 'baemail-log':     await cmdBaemailLog(args[0]); break;
+    case 'baemail-refund':  await cmdBaemailRefund(args[0]); break;
 
     default:
       fail(`Unknown command: ${command || '(none)'}. Commands: setup, identity, address, balance, import, refund, register, unregister, ` +

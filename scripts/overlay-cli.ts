@@ -45,6 +45,16 @@ import {
   cmdXEngagementFulfill,
 } from './lib/x-verification/commands.js';
 
+// Baemail commands
+import {
+  cmdBaemailSetup,
+  cmdBaemailConfig,
+  cmdBaemailBlock,
+  cmdBaemailUnblock,
+  cmdBaemailLog,
+  cmdBaemailRefund,
+} from './lib/baemail/commands.js';
+
 const [, , command, ...args] = process.argv;
 
 async function main() {
@@ -162,13 +172,34 @@ async function main() {
         await cmdXEngagementFulfill(args[0], args[1]);
         break;
 
+      // Baemail Service
+      case 'baemail-setup':
+        await cmdBaemailSetup(args[0], args[1], args[2], args[3]);
+        break;
+      case 'baemail-config':
+        await cmdBaemailConfig();
+        break;
+      case 'baemail-block':
+        await cmdBaemailBlock(args[0]);
+        break;
+      case 'baemail-unblock':
+        await cmdBaemailUnblock(args[0]);
+        break;
+      case 'baemail-log':
+        await cmdBaemailLog(args[0]);
+        break;
+      case 'baemail-refund':
+        await cmdBaemailRefund(args[0]);
+        break;
+
       default:
         fail(
           `Unknown command: ${command || '(none)'}. Commands: setup, identity, address, balance, import, refund, ` +
             `register, unregister, services, advertise, readvertise, remove, discover, pay, verify, accept, ` +
             `send, inbox, ack, poll, connect, request-service, research-queue, research-respond, ` +
             `service-queue, respond-service, x-verify-start, x-verify-complete, x-verifications, x-lookup, ` +
-            `x-engagement-queue, x-engagement-fulfill`
+            `x-engagement-queue, x-engagement-fulfill, baemail-setup, baemail-config, baemail-block, ` +
+            `baemail-unblock, baemail-log, baemail-refund`
         );
     }
   } catch (err: any) {
