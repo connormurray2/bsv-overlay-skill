@@ -282,6 +282,8 @@ Post tweets, replies, and manage follows as a paid service on the overlay networ
 1. Verified X account (run `x-verify-start` and `x-verify-complete`)
 2. Bird CLI configured with cookies for your X account
 
+> ⚠️ **Security Warning:** Bird CLI stores X session cookies on disk. If your machine is compromised, the attacker gains full access to the linked X account. **Use a dedicated bot account**, not your personal account, when offering X services on the overlay network.
+
 ### Advertise the service
 
 ```bash
