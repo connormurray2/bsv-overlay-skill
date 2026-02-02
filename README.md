@@ -364,7 +364,7 @@ Payment amount determines tier (pay >= urgent threshold → urgent delivery).
 }
 ```
 
-### Blocking senders
+### Managing senders & refunds
 
 ```bash
 # Block an identity
@@ -375,7 +375,15 @@ node scripts/overlay-cli.mjs baemail-unblock <identityKey>
 
 # View delivery log
 node scripts/overlay-cli.mjs baemail-log 20
+
+# Refund a failed delivery (sends sats back to sender)
+node scripts/overlay-cli.mjs baemail-refund <requestId>
 ```
+
+### Refund Policy
+
+If delivery fails after payment is accepted, the entry is logged with `refundStatus: 'pending'`. 
+Provider can refund using `baemail-refund <requestId>` which sends the sats back to the sender's derived address.
 
 ---
 

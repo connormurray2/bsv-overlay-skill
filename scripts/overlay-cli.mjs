@@ -5073,66 +5073,31 @@ async function processBaemail(msg, identityKey, privKey) {
     return { id: msg.id, type: 'service-request', serviceId: 'baemail', action: 'rejected', reason: 'wallet error', from: msg.from, ack: true };
   }
 
-  // Format the message for delivery (before accepting payment)
+  // Sender info for message formatting
   const senderName = input?.senderName || 'Anonymous';
   const replyKey = input?.replyIdentityKey || msg.from;
-  
-  // We'll determine tier after payment verification, use placeholder for now
-  const formattedMessageTemplate = (tier, tierEmoji, paidSats) => `${tierEmoji} **Baemail** (${tier.toUpperCase()})
 
-**From:** ${senderName}
-**Paid:** ${paidSats} sats
-**Reply to:** \`${replyKey.slice(0, 16)}...\`
-
----
-
-${message}
-
----
-_Reply via overlay: \`overlay-cli send ${replyKey} ping "your reply"\`_`;
-
-  // ATTEMPT DELIVERY FIRST (before accepting payment)
-  // This ensures we don't take money if we can't deliver
-  let deliverySuccess = false;
-  let deliveryError = null;
+  // Check hooks are configured (but don't pre-test - avoids race condition)
   let hookToken = null;
   let hookPort = 18789;
-
-  try {
-    // Read hook token from OpenClaw config
-    const openclawConfigPath = path.join(os.homedir(), '.openclaw', 'openclaw.json');
-    
-    if (fs.existsSync(openclawConfigPath)) {
-      let openclawConfig;
-      try {
-        openclawConfig = JSON.parse(fs.readFileSync(openclawConfigPath, 'utf-8'));
-      } catch (parseErr) {
-        throw new Error('Failed to parse OpenClaw config');
-      }
+  const openclawConfigPath = path.join(os.homedir(), '.openclaw', 'openclaw.json');
+  
+  if (fs.existsSync(openclawConfigPath)) {
+    try {
+      const openclawConfig = JSON.parse(fs.readFileSync(openclawConfigPath, 'utf-8'));
       hookToken = openclawConfig?.hooks?.token;
       hookPort = openclawConfig?.gateway?.port || 18789;
+    } catch (parseErr) {
+      console.warn('[baemail] Failed to parse OpenClaw config:', parseErr.message);
     }
-
-    if (!hookToken) {
-      throw new Error('OpenClaw hooks not configured - cannot deliver messages');
-    }
-
-    // Test that we can reach the hook endpoint (lightweight check)
-    const hookUrl = `http://127.0.0.1:${hookPort}/hooks/agent`;
-    
-    // Mark delivery as possible (we'll do actual delivery after payment)
-    deliverySuccess = true;
-  } catch (err) {
-    deliveryError = err.message;
   }
 
-  // If delivery is not possible, reject without accepting payment
-  if (!deliverySuccess) {
+  if (!hookToken) {
     const rejectPayload = {
       requestId: msg.id,
       serviceId: 'baemail',
       status: 'rejected',
-      reason: `Delivery not available: ${deliveryError}. Payment NOT accepted.`,
+      reason: 'OpenClaw hooks not configured. Payment NOT accepted.',
     };
     const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
     await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
@@ -5140,10 +5105,10 @@ _Reply via overlay: \`overlay-cli send ${replyKey} ping "your reply"\`_`;
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
     });
-    return { id: msg.id, type: 'service-request', serviceId: 'baemail', action: 'rejected', reason: deliveryError, from: msg.from, ack: true };
+    return { id: msg.id, type: 'service-request', serviceId: 'baemail', action: 'rejected', reason: 'hooks not configured', from: msg.from, ack: true };
   }
 
-  // NOW verify and accept payment (only after confirming we can deliver)
+  // Verify and accept payment
   const ourHash160 = Hash.hash160(PrivateKey.fromHex(walletIdentity.rootKeyHex).toPublicKey().encode(true));
   const minPrice = config.tiers.standard;
   
@@ -5177,13 +5142,26 @@ _Reply via overlay: \`overlay-cli send ${replyKey} ping "your reply"\`_`;
     tierEmoji = '⚡';
   }
 
-  // Now actually deliver the message
-  const formattedMessage = formattedMessageTemplate(tier, tierEmoji, paidSats);
-  let actualDeliverySuccess = false;
-  let actualDeliveryError = null;
+  // Format and deliver the message
+  const formattedMessage = `${tierEmoji} **Baemail** (${tier.toUpperCase()})
+
+**From:** ${senderName}
+**Paid:** ${paidSats} sats
+**Reply to:** \`${replyKey.slice(0, 16)}...\`
+
+---
+
+${message}
+
+---
+_Reply via overlay: \`overlay-cli send ${replyKey} ping "your reply"\`_`;
+
+  let deliverySuccess = false;
+  let deliveryError = null;
 
   try {
-    const hookUrl = `http://127.0.0.1:${hookPort}/hooks/agent`;
+    const hookHost = process.env.CLAWDBOT_HOST || process.env.OPENCLAW_HOST || '127.0.0.1';
+    const hookUrl = `http://${hookHost}:${hookPort}/hooks/agent`;
     const hookResp = await fetchWithTimeout(hookUrl, {
       method: 'POST',
       headers: {
@@ -5202,16 +5180,16 @@ _Reply via overlay: \`overlay-cli send ${replyKey} ping "your reply"\`_`;
     });
 
     if (hookResp.ok) {
-      actualDeliverySuccess = true;
+      deliverySuccess = true;
     } else {
       const body = await hookResp.text().catch(() => '');
-      actualDeliveryError = `Hook failed: ${hookResp.status} ${body}`;
+      deliveryError = `Hook failed: ${hookResp.status} ${body}`;
     }
   } catch (err) {
-    actualDeliveryError = err.message;
+    deliveryError = err.message;
   }
 
-  // Log the delivery attempt
+  // Log the delivery attempt (with refund status if failed)
   const logPath = path.join(OVERLAY_STATE_DIR, 'baemail-log.jsonl');
   const logEntry = {
     requestId: msg.id,
@@ -5221,9 +5199,10 @@ _Reply via overlay: \`overlay-cli send ${replyKey} ping "your reply"\`_`;
     paidSats,
     messageLength: message.length,
     deliveryChannel: config.deliveryChannel,
-    deliverySuccess: actualDeliverySuccess,
-    deliveryError: actualDeliveryError,
+    deliverySuccess,
+    deliveryError,
     paymentTxid: payResult.txid,
+    refundStatus: deliverySuccess ? null : 'pending',
     timestamp: new Date().toISOString(),
   };
   fs.appendFileSync(logPath, JSON.stringify(logEntry) + '\n');
@@ -5232,15 +5211,16 @@ _Reply via overlay: \`overlay-cli send ${replyKey} ping "your reply"\`_`;
   const responsePayload = {
     requestId: msg.id,
     serviceId: 'baemail',
-    status: actualDeliverySuccess ? 'fulfilled' : 'delivery_failed',
+    status: deliverySuccess ? 'fulfilled' : 'delivery_failed',
     result: {
-      delivered: actualDeliverySuccess,
+      delivered: deliverySuccess,
       tier,
       channel: config.deliveryChannel,
       paidSats,
-      error: actualDeliveryError,
+      error: deliveryError,
       replyTo: identityKey,
-      note: actualDeliverySuccess ? undefined : 'Payment was accepted. Contact provider for refund if delivery failed.',
+      refundable: !deliverySuccess,
+      note: deliverySuccess ? undefined : 'Delivery failed. Run: baemail-refund ' + msg.id,
     },
     paymentAccepted: true,
     paymentTxid: payResult.txid,
@@ -5256,10 +5236,10 @@ _Reply via overlay: \`overlay-cli send ${replyKey} ping "your reply"\`_`;
 
   return {
     id: msg.id, type: 'service-request', serviceId: 'baemail',
-    action: actualDeliverySuccess ? 'fulfilled' : 'delivery_failed',
+    action: deliverySuccess ? 'fulfilled' : 'delivery_failed',
     tier,
-    deliverySuccess: actualDeliverySuccess,
-    deliveryError: actualDeliveryError,
+    deliverySuccess,
+    deliveryError,
     paymentAccepted: true, paymentTxid: payResult.txid,
     satoshisReceived: payResult.satoshis,
     from: msg.from, ack: true,
@@ -5285,6 +5265,141 @@ async function cmdBaemailLog(limitStr) {
   const recent = entries.slice(-limit).reverse();
   ok({ log: recent, count: entries.length, showing: recent.length });
 }
+
+/**
+ * Refund a failed baemail delivery.
+ * Sends the received sats back to the sender.
+ */
+async function cmdBaemailRefund(requestId) {
+  if (!requestId) return fail('Usage: baemail-refund <requestId>');
+
+  const logPath = path.join(OVERLAY_STATE_DIR, 'baemail-log.jsonl');
+  if (!fs.existsSync(logPath)) {
+    return fail('No baemail log found');
+  }
+
+  // Find the entry
+  const lines = fs.readFileSync(logPath, 'utf-8').split('\n').filter(l => l.trim());
+  const entries = lines.map((l, idx) => {
+    try { return { ...JSON.parse(l), _lineIdx: idx }; } catch { return null; }
+  }).filter(Boolean);
+
+  const entry = entries.find(e => e.requestId === requestId);
+  if (!entry) {
+    return fail(`Request ${requestId} not found in baemail log`);
+  }
+
+  if (entry.deliverySuccess) {
+    return fail('This delivery was successful — no refund needed');
+  }
+
+  if (entry.refundStatus === 'completed') {
+    return fail('Refund already processed for this request');
+  }
+
+  // Load wallet
+  const { identityKey, privKey } = loadIdentity();
+  const walletIdentity = JSON.parse(fs.readFileSync(path.join(WALLET_DIR, 'wallet-identity.json'), 'utf-8'));
+
+  // Calculate refund amount (same as received, minus small tx fee)
+  const refundSats = entry.paidSats - 1; // Keep 1 sat for tx fee
+  if (refundSats < 1) {
+    return fail('Amount too small to refund');
+  }
+
+  // Derive refund address from sender's identity key (BRC-29 style)
+  const senderPubKey = PublicKey.fromString(entry.from);
+  const refundAddress = senderPubKey.toAddress().toString();
+
+  // Create and broadcast refund transaction
+  try {
+    // Load UTXOs
+    const address = walletIdentity.address;
+    const utxosResp = await fetchWithTimeout(`https://api.whatsonchain.com/v1/bsv/main/address/${address}/unspent`);
+    const utxos = await utxosResp.json();
+
+    if (!utxos || utxos.length === 0) {
+      return fail('No UTXOs available for refund');
+    }
+
+    // Build transaction
+    const tx = new Transaction();
+    let totalInput = 0;
+    const rootKey = PrivateKey.fromHex(walletIdentity.rootKeyHex);
+
+    for (const utxo of utxos) {
+      if (totalInput >= refundSats + 50) break; // enough for refund + fee buffer
+      tx.addInput({
+        sourceTXID: utxo.tx_hash,
+        sourceOutputIndex: utxo.tx_pos,
+        sourceSatoshis: utxo.value,
+        script: new P2PKH().lock(rootKey.toPublicKey().toAddress()).toHex(),
+        unlockingScriptTemplate: new P2PKH().unlock(rootKey),
+      });
+      totalInput += utxo.value;
+    }
+
+    if (totalInput < refundSats + 10) {
+      return fail('Insufficient funds for refund');
+    }
+
+    // Refund output
+    tx.addOutput({
+      satoshis: refundSats,
+      lockingScript: new P2PKH().lock(refundAddress),
+    });
+
+    // Change output (if any)
+    const fee = 10;
+    const change = totalInput - refundSats - fee;
+    if (change > 1) {
+      tx.addOutput({
+        satoshis: change,
+        lockingScript: new P2PKH().lock(rootKey.toPublicKey().toAddress()),
+      });
+    }
+
+    await tx.sign();
+
+    // Broadcast via WoC
+    const beef = tx.toHexBEEF();
+    const broadcastResp = await fetchWithTimeout('https://api.whatsonchain.com/v1/bsv/main/tx/raw', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ txhex: tx.toHex() }),
+    });
+
+    if (!broadcastResp.ok) {
+      const errBody = await broadcastResp.text();
+      return fail(`Broadcast failed: ${errBody}`);
+    }
+
+    const txid = tx.id('hex');
+
+    // Update log entry
+    const updatedLines = lines.map((l, idx) => {
+      if (idx === entry._lineIdx) {
+        const updated = { ...JSON.parse(l), refundStatus: 'completed', refundTxid: txid, refundedAt: new Date().toISOString() };
+        return JSON.stringify(updated);
+      }
+      return l;
+    });
+    fs.writeFileSync(logPath, updatedLines.join('\n') + '\n');
+
+    ok({
+      refunded: true,
+      requestId,
+      refundSats,
+      refundAddress,
+      txid,
+      note: `Refunded ${refundSats} sats to sender`,
+    });
+
+  } catch (err) {
+    return fail(`Refund failed: ${err.message}`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Poll command — uses shared processMessage
 // ---------------------------------------------------------------------------
@@ -5732,6 +5847,7 @@ try {
     case 'baemail-block':   await cmdBaemailBlock(args[0]); break;
     case 'baemail-unblock': await cmdBaemailUnblock(args[0]); break;
     case 'baemail-log':     await cmdBaemailLog(args[0]); break;
+    case 'baemail-refund':  await cmdBaemailRefund(args[0]); break;
 
     default:
       fail(`Unknown command: ${command || '(none)'}. Commands: setup, identity, address, balance, import, refund, register, unregister, ` +
