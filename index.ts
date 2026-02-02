@@ -229,9 +229,15 @@ function categorizeEvent(event) {
   }
   
   // 📬 Response received — a service we requested came back
+  // Fields come directly from the CLI event, not nested under .payload
   if (event.type === 'service-response' && event.action === 'received') {
-    const payload = event.payload || {};
-    return { ...base, type: 'response_received', emoji: '📬', serviceId: payload.serviceId, status: payload.status, message: `Response received for ${payload.serviceId}: ${payload.status}` };
+    return {
+      ...base, type: 'response_received', emoji: '📬',
+      serviceId: event.serviceId, status: event.status,
+      result: event.result, requestId: event.requestId,
+      formatted: event.formatted,
+      message: event.formatted || `Response received for ${event.serviceId}: ${event.status}`,
+    };
   }
   
   // ❌ Request rejected
@@ -268,10 +274,25 @@ function startBackgroundService(env, cliPath, logger) {
           fs.mkdirSync(alertDir, { recursive: true });
           
           // Detect queued-for-agent events — invoke agent via /hooks/agent
+          // This is the PROVIDER side: someone requested our service
           if (event.action === 'queued-for-agent' && event.serviceId) {
             logger?.info?.(`[bsv-overlay] ⚡ Incoming ${event.serviceId} request from ${event.from?.slice(0, 12)}...`);
             const wakeText = `⚡ Incoming overlay service request!\n\nService: ${event.serviceId}\nFrom: ${event.from}\nPaid: ${event.satoshisReceived || '?'} sats\n\nFulfill it now:\n1. overlay({ action: "pending-requests" })\n2. Process the ${event.serviceId} request using your capabilities\n3. overlay({ action: "fulfill", requestId: "${event.id}", recipientKey: "${event.from}", serviceId: "${event.serviceId}", result: { ... } })`;
             wakeAgent(wakeText, logger, { sessionKey: `hook:bsv-overlay:${event.id || Date.now()}` });
+          }
+          
+          // Detect service-response events — invoke agent to notify user
+          // This is the REQUESTER side: we requested a service, response came back
+          if (event.type === 'service-response' && event.action === 'received') {
+            const svcId = event.serviceId || 'unknown';
+            const status = event.status || 'unknown';
+            const from = event.from || 'unknown';
+            const formatted = event.formatted || '';
+            const resultJson = event.result ? JSON.stringify(event.result, null, 2) : '(no result data)';
+            
+            logger?.info?.(`[bsv-overlay] 📬 Response received for ${svcId} from ${from?.slice(0, 12)}... — status: ${status}`);
+            const wakeText = `📬 Overlay service response received!\n\nService: ${svcId}\nFrom: ${from}\nStatus: ${status}\n${formatted ? `\nSummary: ${formatted}` : ''}\n\nFull result:\n${resultJson}\n\nNotify the user of this response in a clear, human-readable format.`;
+            wakeAgent(wakeText, logger, { sessionKey: `hook:bsv-overlay:resp-${event.requestId || Date.now()}` });
           }
           
           // Write payment/activity notifications for ALL significant events
@@ -773,7 +794,7 @@ async function handleServiceRequest(params, env, cliPath, config, api) {
     throw new Error(`Service request would exceed daily budget. Spent: ${budgetCheck.spent} sats, Remaining: ${budgetCheck.remaining} sats, Requested: ${price} sats. Please confirm with user.`);
   }
 
-  api.logger.info(`Requesting service ${service} from ${bestProvider.agentName} for ${price} sats`);
+  api.logger.info(`Requesting service ${service} from ${bestProvider.name} for ${price} sats`);
 
   // 6. Request the service
   const requestArgs = [cliPath, 'request-service', bestProvider.identityKey, service, price.toString()];
@@ -788,55 +809,20 @@ async function handleServiceRequest(params, env, cliPath, config, api) {
     throw new Error(`Service request failed: ${requestOutput.error}`);
   }
 
-  // 7. Poll for response (up to 120s, with early return)
-  // The WebSocket background service will also receive the response
-  // asynchronously, so we return a "pending" status if we time out
-  // rather than throwing an error.
-  const maxPollAttempts = 24; // ~120 seconds with 5 second intervals
-  let attempts = 0;
+  // 7. Return immediately — no polling.
+  // The WebSocket background service handles incoming responses
+  // asynchronously and wakes the agent via /hooks/agent when a
+  // response arrives. This avoids blocking for up to 120s.
+  recordSpend(walletDir, price, service, bestProvider.name);
+  writeActivityEvent({ type: 'outgoing_payment', emoji: '💸', sats: price, service, provider: bestProvider.name, message: `Paid ${price} sats to ${bestProvider.name} for ${service}` });
   
-  while (attempts < maxPollAttempts) {
-    await sleep(5000); // Wait 5 seconds
-    attempts++;
-    
-    try {
-      const pollEnv = { ...env, AGENT_ROUTED: 'true' };
-      const pollResult = await execFileAsync('node', [cliPath, 'poll'], { env: pollEnv });
-      const pollOutput = parseCliOutput(pollResult.stdout);
-      
-      if (pollOutput.success && pollOutput.data) {
-        // Check pollOutput.data.messages array for service-response
-        const messages = pollOutput.data.messages || [];
-        for (const msg of messages) {
-          if (msg.type === 'service-response' && msg.from === bestProvider.identityKey) {
-            api.logger.info(`Received response from ${bestProvider.agentName}`);
-            recordSpend(walletDir, price, service, bestProvider.agentName);
-            writeActivityEvent({ type: 'outgoing_payment', emoji: '💸', sats: price, service, provider: bestProvider.agentName, message: `Paid ${price} sats to ${bestProvider.agentName} for ${service}` });
-            writeActivityEvent({ type: 'response_received', emoji: '📬', service, provider: bestProvider.agentName, status: msg.payload?.status, message: `${service} response received from ${bestProvider.agentName}` });
-            return {
-              provider: bestProvider.agentName,
-              cost: price,
-              result: msg.payload
-            };
-          }
-        }
-      }
-    } catch (pollError) {
-      // Continue polling even if one poll fails
-      api.logger.warn(`Poll attempt ${attempts} failed: ${pollError.message}`);
-    }
-  }
-  
-  // Don't throw — the response may still arrive via WebSocket
-  recordSpend(walletDir, price, service, bestProvider.agentName);
-  writeActivityEvent({ type: 'outgoing_payment', emoji: '💸', sats: price, service, provider: bestProvider.agentName, message: `Paid ${price} sats to ${bestProvider.agentName} for ${service} (awaiting response)` });
   return {
-    provider: bestProvider.agentName,
-    cost: price,
-    status: "pending",
-    message: `Request sent and paid (${price} sats). The provider hasn't responded within 120s, but the response may still arrive via the background WebSocket service. Check notifications later.`,
-    requestId: requestOutput.data?.messageId,
+    provider: bestProvider.name,
     providerKey: bestProvider.identityKey,
+    cost: price,
+    status: "sent",
+    requestId: requestOutput.data?.messageId,
+    message: `Request sent and paid (${price} sats) to ${bestProvider.name}. The response will be delivered asynchronously when the provider fulfills it.`,
   };
 }
 
@@ -1257,6 +1243,4 @@ function parseCliOutput(stdout) {
   }
 }
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+// sleep() removed — no longer needed since polling loop was removed
