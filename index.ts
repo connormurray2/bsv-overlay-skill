@@ -752,7 +752,7 @@ async function executeOverlayAction(params, config, api) {
 }
 
 async function handleServiceRequest(params, env, cliPath, config, api) {
-  const { service, input, maxPrice } = params;
+  const { service, identityKey: targetKey, input, maxPrice } = params;
   const walletDir = config?.walletDir || path.join(process.env.HOME || '', '.clawdbot', 'bsv-wallet');
   
   if (!service) {
@@ -778,9 +778,18 @@ async function handleServiceRequest(params, env, cliPath, config, api) {
   const identityOutput = parseCliOutput(identityResult.stdout);
   const ourKey = identityOutput.data?.identityKey;
   
-  const externalProviders = providers.filter(p => p.identityKey !== ourKey);
+  let externalProviders = providers.filter(p => p.identityKey !== ourKey);
   if (externalProviders.length === 0) {
     throw new Error("No external providers available (only found our own services)");
+  }
+
+  // 2b. If caller specified a target identityKey, route to that provider specifically
+  if (targetKey) {
+    const targeted = externalProviders.filter(p => p.identityKey === targetKey);
+    if (targeted.length === 0) {
+      throw new Error(`Specified provider ${targetKey} not found or is our own key. Available: ${externalProviders.map(p => p.identityKey).join(', ')}`);
+    }
+    externalProviders = targeted;
   }
 
   // 3. Sort by price - FIX: Use pricing.amountSats instead of pricingSats
