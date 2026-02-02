@@ -3,8 +3,6 @@ import { promisify } from 'util';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
-import WebSocket from 'ws';
-
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -141,13 +139,9 @@ function stopAutoImport() {
   }
 }
 
-// Discover the gateway WebSocket port from environment
+// Discover the gateway HTTP port from environment
 function getGatewayPort(): string {
   return process.env.CLAWDBOT_GATEWAY_PORT || process.env.OPENCLAW_GATEWAY_PORT || '18789';
-}
-
-function getGatewayWsUrl(): string {
-  return `ws://127.0.0.1:${getGatewayPort()}`;
 }
 
 // Read tokens from env vars or config files.
@@ -172,128 +166,55 @@ function getTokens(): { hooksToken: string | null; gatewayToken: string | null }
   return { hooksToken, gatewayToken };
 }
 
-// Wake the agent — tries HTTP /hooks/wake first (simple, works on OpenClaw),
-// falls back to WebSocket connect handshake (works on Clawdbot).
-function wakeAgent(text: string, logger?: any) {
+// Wake the agent via /hooks/agent — runs an isolated agent turn with the
+// message as the actual prompt, so the agent sees the request and can act.
+// NOTE: /hooks/wake only triggers a heartbeat (reads HEARTBEAT.md) which
+// won't surface the overlay request to the agent. /hooks/agent is required.
+function wakeAgent(text: string, logger?: any, opts?: { sessionKey?: string }) {
   const { hooksToken, gatewayToken } = getTokens();
   const port = getGatewayPort();
-
-  // Strategy 1: HTTP hooks/wake (preferred — simple token auth, no device crypto)
   const httpToken = hooksToken || gatewayToken;
-  if (httpToken) {
-    const url = `http://127.0.0.1:${port}/hooks/wake`;
-    fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${httpToken}`,
-        'x-clawdbot-token': httpToken,
-        'x-openclaw-token': httpToken,
-      },
-      body: JSON.stringify({ text, mode: 'now' }),
+
+  if (!httpToken) {
+    logger?.warn?.('[bsv-overlay] No gateway/hooks token available — cannot invoke agent');
+    return;
+  }
+
+  const url = `http://127.0.0.1:${port}/hooks/agent`;
+  const sessionKey = opts?.sessionKey || `hook:bsv-overlay:${Date.now()}`;
+
+  fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${httpToken}`,
+      'x-clawdbot-token': httpToken,
+    },
+    body: JSON.stringify({
+      message: text,
+      name: 'BSV Overlay',
+      sessionKey,
+      wakeMode: 'now',
+      deliver: true,
+      channel: 'last',
+    }),
+  })
+    .then(async (res) => {
+      if (res.ok) {
+        logger?.info?.(`[bsv-overlay] Agent invoked via /hooks/agent (session: ${sessionKey})`);
+      } else {
+        const body = await res.text().catch(() => '');
+        logger?.warn?.(`[bsv-overlay] /hooks/agent failed: ${res.status} ${body}`);
+      }
     })
-      .then((res) => {
-        if (res.ok) {
-          logger?.info?.('[bsv-overlay] Agent woken via HTTP hooks/wake');
-        } else if (res.status === 405 || res.status === 404) {
-          // Hooks endpoint not enabled — fall back to WebSocket
-          logger?.info?.('[bsv-overlay] HTTP hooks not available, falling back to WebSocket');
-          wakeAgentWebSocket(text, gatewayToken, logger);
-        } else {
-          logger?.warn?.(`[bsv-overlay] hooks/wake failed: ${res.status}`);
-          // Try WebSocket as last resort
-          wakeAgentWebSocket(text, gatewayToken, logger);
-        }
-      })
-      .catch((err) => {
-        logger?.warn?.('[bsv-overlay] HTTP wake error, trying WebSocket:', err.message);
-        wakeAgentWebSocket(text, gatewayToken, logger);
-      });
-  } else {
-    // No token at all — try WebSocket anyway (might work on loopback)
-    wakeAgentWebSocket(text, gatewayToken, logger);
-  }
+    .catch((err) => {
+      logger?.warn?.('[bsv-overlay] /hooks/agent error:', err.message);
+    });
 }
 
-// Fallback: WebSocket wake with full gateway connect handshake
-function wakeAgentWebSocket(text: string, token: string | null, logger?: any) {
-  try {
-    const ws = new WebSocket(getGatewayWsUrl());
-    const timeout = setTimeout(() => { try { ws.close(); } catch {} }, 8000);
-    let authenticated = false;
-    let reqId = 1;
-
-    function nextId() { return `overlay-${reqId++}`; }
-
-    function sendWake() {
-      ws.send(JSON.stringify({
-        type: 'req',
-        id: nextId(),
-        method: 'cron.wake',
-        params: { mode: 'now', text },
-      }));
-      logger?.info?.('[bsv-overlay] Agent woken via WebSocket');
-      clearTimeout(timeout);
-      setTimeout(() => { try { ws.close(); } catch {} }, 1000);
-    }
-
-    ws.on('message', (data) => {
-      try {
-        const msg = JSON.parse(data.toString());
-
-        if (msg.type === 'event' && msg.event === 'connect.challenge') {
-          if (!token) {
-            logger?.warn?.('[bsv-overlay] No gateway token for auth challenge');
-            ws.close();
-            return;
-          }
-          ws.send(JSON.stringify({
-            type: 'req',
-            id: nextId(),
-            method: 'connect',
-            params: {
-              minProtocol: 3,
-              maxProtocol: 3,
-              client: {
-                id: 'cli',
-                displayName: 'BSV Overlay Plugin',
-                version: '0.2.18',
-                platform: process.platform,
-                mode: 'cli',
-              },
-              caps: [],
-              auth: { token },
-              role: 'operator',
-            },
-          }));
-          return;
-        }
-
-        if ((msg.type === 'event' && msg.event === 'connect.ready') ||
-            (msg.type === 'res' && msg.ok === true && !authenticated)) {
-          authenticated = true;
-          sendWake();
-          return;
-        }
-
-        if (msg.type === 'res' && msg.ok === false && !authenticated) {
-          logger?.warn?.('[bsv-overlay] Gateway WS auth failed:', msg.error?.message || 'unknown');
-          ws.close();
-          return;
-        }
-      } catch {}
-    });
-
-    ws.on('error', (err) => {
-      clearTimeout(timeout);
-      logger?.warn?.('[bsv-overlay] WebSocket wake failed:', err.message);
-    });
-
-    ws.on('close', () => { clearTimeout(timeout); });
-  } catch (err: any) {
-    logger?.warn?.('[bsv-overlay] WebSocket wake failed:', err.message);
-  }
-}
+// NOTE: WebSocket wake fallback removed — it used cron.wake which triggers
+// a heartbeat (same problem as /hooks/wake). /hooks/agent is the correct
+// approach for invoking the agent with a specific prompt.
 
 // Categorize WebSocket events into notification types
 function categorizeEvent(event) {
@@ -346,11 +267,11 @@ function startBackgroundService(env, cliPath, logger) {
           const alertDir = path.join(process.env.HOME || '', '.clawdbot', 'bsv-overlay');
           fs.mkdirSync(alertDir, { recursive: true });
           
-          // Detect queued-for-agent events — wake agent via WebSocket
+          // Detect queued-for-agent events — invoke agent via /hooks/agent
           if (event.action === 'queued-for-agent' && event.serviceId) {
             logger?.info?.(`[bsv-overlay] ⚡ Incoming ${event.serviceId} request from ${event.from?.slice(0, 12)}...`);
             const wakeText = `⚡ Incoming overlay service request!\n\nService: ${event.serviceId}\nFrom: ${event.from}\nPaid: ${event.satoshisReceived || '?'} sats\n\nFulfill it now:\n1. overlay({ action: "pending-requests" })\n2. Process the ${event.serviceId} request using your capabilities\n3. overlay({ action: "fulfill", requestId: "${event.id}", recipientKey: "${event.from}", serviceId: "${event.serviceId}", result: { ... } })`;
-            wakeAgent(wakeText, logger);
+            wakeAgent(wakeText, logger, { sessionKey: `hook:bsv-overlay:${event.id || Date.now()}` });
           }
           
           // Write payment/activity notifications for ALL significant events
