@@ -360,7 +360,7 @@ async function buildRealOverlayTransaction(payload, topic) {
   try {
     return await buildWalletCreateActionTx(payload, topic, identity);
   } catch (walletErr) {
-    return buildSyntheticTx(payload, privKey, pubKey);
+    return await buildSyntheticTx(payload, privKey, pubKey);
   }
 }
 
@@ -450,6 +450,21 @@ async function buildFromStoredBeef(payload, topic, storedChange, privKey, pubKey
 
   // Submit to overlay
   const steak = await submitToOverlay(beef, [topic]);
+
+  // CRITICAL: Broadcast to blockchain
+  try {
+    const broadcastResp = await wocFetch(`/tx/raw`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ txhex: tx.toHex() }),
+    });
+    if (!broadcastResp.ok) {
+      const errText = await broadcastResp.text();
+      console.error(`[broadcast] Failed: ${broadcastResp.status} — ${errText}`);
+    }
+  } catch (bcastErr) {
+    console.error(`[broadcast] Error: ${bcastErr.message}`);
+  }
 
   // Save this tx's change for next time
   if (changeSats > 0) {
@@ -601,6 +616,21 @@ async function buildRealFundedTx(payload, topic, utxo, privKey, pubKey, hash160,
   // Submit to overlay
   const steak = await submitToOverlay(beef, [topic]);
 
+  // CRITICAL: Broadcast to blockchain
+  try {
+    const broadcastResp = await wocFetch(`/tx/raw`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ txhex: tx.toHex() }),
+    });
+    if (!broadcastResp.ok) {
+      const errText = await broadcastResp.text();
+      console.error(`[broadcast] Failed: ${broadcastResp.status} — ${errText}`);
+    }
+  } catch (bcastErr) {
+    console.error(`[broadcast] Error: ${bcastErr.message}`);
+  }
+
   // Save the change BEEF for instant chaining (no WoC needed next time)
   if (changeSats > 0) {
     saveChangeBeef(tx, changeSats, 1);
@@ -708,6 +738,21 @@ async function buildWalletCreateActionTx(payload, topic, identity) {
     const lastTx = parsedBeef.txs[parsedBeef.txs.length - 1];
     const txid = lastTx.txid;
 
+    // CRITICAL: Broadcast to blockchain
+    try {
+      const broadcastResp = await wocFetch(`/tx/raw`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ txhex: lastTx.toHex() }),
+      });
+      if (!broadcastResp.ok) {
+        const errText = await broadcastResp.text();
+        console.error(`[broadcast] Wallet-internal tx failed: ${broadcastResp.status} — ${errText}`);
+      }
+    } catch (bcastErr) {
+      console.error(`[broadcast] Wallet-internal tx error: ${bcastErr.message}`);
+    }
+
     return { txid, beef, steak, funded: 'wallet-internal' };
   } catch (err) {
     await wallet.destroy();
@@ -717,7 +762,7 @@ async function buildWalletCreateActionTx(payload, topic, identity) {
 
 /** Synthetic (unfunded) transaction — works only with SCRIPTS_ONLY overlay.
  *  Issue #6: Blocked on mainnet unless ALLOW_SYNTHETIC=true env var is set. */
-function buildSyntheticTx(payload, privKey, pubKey) {
+async function buildSyntheticTx(payload, privKey, pubKey) {
   // Guard: never use synthetic funding on mainnet without explicit opt-in
   if (NETWORK === 'mainnet' && process.env.ALLOW_SYNTHETIC !== 'true') {
     throw new Error('No funds available. Import a UTXO first: overlay-cli import <txid>');
@@ -757,6 +802,22 @@ function buildSyntheticTx(payload, privKey, pubKey) {
 
   const beef = tx.toBEEF();
   const txid = tx.id('hex');
+  
+  // CRITICAL: Broadcast to blockchain (even synthetic txs should be broadcast for relay to nodes)
+  try {
+    const broadcastResp = await wocFetch(`/tx/raw`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ txhex: tx.toHex() }),
+    });
+    if (!broadcastResp.ok) {
+      const errText = await broadcastResp.text();
+      console.error(`[broadcast] Synthetic tx failed: ${broadcastResp.status} — ${errText}`);
+    }
+  } catch (bcastErr) {
+    console.error(`[broadcast] Synthetic tx error: ${bcastErr.message}`);
+  }
+  
   return { txid, beef, funded: 'synthetic' };
 }
 
