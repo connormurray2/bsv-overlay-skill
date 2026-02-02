@@ -29,6 +29,7 @@ interface BaemailInput {
   message?: string;
   senderName?: string;
   replyIdentityKey?: string;
+  refundAddress?: string; // BSV address for refunds if delivery fails
 }
 
 interface ServiceMessage {
@@ -289,6 +290,7 @@ _Reply via overlay: \`overlay-cli send ${replyKey} ping "your reply"\`_`;
     deliverySuccess,
     deliveryError: deliveryError ?? null,
     paymentTxid: payResult.txid || '',
+    refundAddress: input.refundAddress, // Store sender-provided refund address
     refundStatus: deliverySuccess ? null : 'pending',
     timestamp: new Date().toISOString(),
   };

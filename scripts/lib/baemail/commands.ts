@@ -36,6 +36,7 @@ export interface BaemailLogEntry {
   deliverySuccess: boolean;
   deliveryError: string | null;
   paymentTxid: string;
+  refundAddress?: string; // Sender-provided refund address
   refundStatus: string | null;
   refundTxid?: string;
   refundedAt?: string;
@@ -236,9 +237,16 @@ export async function cmdBaemailRefund(requestId: string | undefined): Promise<n
     return fail('Amount too small to refund');
   }
 
-  // Derive refund address from sender's identity key
-  const senderPubKey = PublicKey.fromString(entry.from);
-  const refundAddress = senderPubKey.toAddress().toString();
+  // Get refund address: use stored address if provided, otherwise derive from identity key
+  let refundAddress: string;
+  if (entry.refundAddress) {
+    refundAddress = entry.refundAddress;
+  } else {
+    // Fallback: derive from sender's identity key (may not match payment source!)
+    const senderPubKey = PublicKey.fromString(entry.from);
+    refundAddress = senderPubKey.toAddress().toString();
+    console.log('⚠️  No refund address stored — deriving from identity key (may not match payment source)');
+  }
 
   try {
     // Load UTXOs
