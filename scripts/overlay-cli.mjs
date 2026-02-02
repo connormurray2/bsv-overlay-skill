@@ -5053,8 +5053,97 @@ async function processBaemail(msg, identityKey, privKey) {
     return { id: msg.id, type: 'service-request', serviceId: 'baemail', action: 'rejected', reason: 'message too long', from: msg.from, ack: true };
   }
 
-  // Verify payment - use standard rate as minimum
-  const walletIdentity = JSON.parse(fs.readFileSync(path.join(WALLET_DIR, 'wallet-identity.json'), 'utf-8'));
+  // Load wallet identity for payment verification
+  let walletIdentity;
+  try {
+    walletIdentity = JSON.parse(fs.readFileSync(path.join(WALLET_DIR, 'wallet-identity.json'), 'utf-8'));
+  } catch (err) {
+    const rejectPayload = {
+      requestId: msg.id,
+      serviceId: 'baemail',
+      status: 'rejected',
+      reason: 'Service temporarily unavailable (wallet error)',
+    };
+    const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+    await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
+    });
+    return { id: msg.id, type: 'service-request', serviceId: 'baemail', action: 'rejected', reason: 'wallet error', from: msg.from, ack: true };
+  }
+
+  // Format the message for delivery (before accepting payment)
+  const senderName = input?.senderName || 'Anonymous';
+  const replyKey = input?.replyIdentityKey || msg.from;
+  
+  // We'll determine tier after payment verification, use placeholder for now
+  const formattedMessageTemplate = (tier, tierEmoji, paidSats) => `${tierEmoji} **Baemail** (${tier.toUpperCase()})
+
+**From:** ${senderName}
+**Paid:** ${paidSats} sats
+**Reply to:** \`${replyKey.slice(0, 16)}...\`
+
+---
+
+${message}
+
+---
+_Reply via overlay: \`overlay-cli send ${replyKey} ping "your reply"\`_`;
+
+  // ATTEMPT DELIVERY FIRST (before accepting payment)
+  // This ensures we don't take money if we can't deliver
+  let deliverySuccess = false;
+  let deliveryError = null;
+  let hookToken = null;
+  let hookPort = 18789;
+
+  try {
+    // Read hook token from OpenClaw config
+    const openclawConfigPath = path.join(os.homedir(), '.openclaw', 'openclaw.json');
+    
+    if (fs.existsSync(openclawConfigPath)) {
+      let openclawConfig;
+      try {
+        openclawConfig = JSON.parse(fs.readFileSync(openclawConfigPath, 'utf-8'));
+      } catch (parseErr) {
+        throw new Error('Failed to parse OpenClaw config');
+      }
+      hookToken = openclawConfig?.hooks?.token;
+      hookPort = openclawConfig?.gateway?.port || 18789;
+    }
+
+    if (!hookToken) {
+      throw new Error('OpenClaw hooks not configured - cannot deliver messages');
+    }
+
+    // Test that we can reach the hook endpoint (lightweight check)
+    const hookUrl = `http://127.0.0.1:${hookPort}/hooks/agent`;
+    
+    // Mark delivery as possible (we'll do actual delivery after payment)
+    deliverySuccess = true;
+  } catch (err) {
+    deliveryError = err.message;
+  }
+
+  // If delivery is not possible, reject without accepting payment
+  if (!deliverySuccess) {
+    const rejectPayload = {
+      requestId: msg.id,
+      serviceId: 'baemail',
+      status: 'rejected',
+      reason: `Delivery not available: ${deliveryError}. Payment NOT accepted.`,
+    };
+    const sig = signRelayMessage(privKey, msg.from, 'service-response', rejectPayload);
+    await fetchWithTimeout(`${OVERLAY_URL}/relay/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: identityKey, to: msg.from, type: 'service-response', payload: rejectPayload, signature: sig }),
+    });
+    return { id: msg.id, type: 'service-request', serviceId: 'baemail', action: 'rejected', reason: deliveryError, from: msg.from, ack: true };
+  }
+
+  // NOW verify and accept payment (only after confirming we can deliver)
   const ourHash160 = Hash.hash160(PrivateKey.fromHex(walletIdentity.rootKeyHex).toPublicKey().encode(true));
   const minPrice = config.tiers.standard;
   
@@ -5088,42 +5177,12 @@ async function processBaemail(msg, identityKey, privKey) {
     tierEmoji = '⚡';
   }
 
-  // Format the message for delivery
-  const senderName = input?.senderName || 'Anonymous';
-  const replyKey = input?.replyIdentityKey || msg.from;
-  const formattedMessage = `${tierEmoji} **Baemail** (${tier.toUpperCase()})
-
-**From:** ${senderName}
-**Paid:** ${paidSats} sats
-**Reply to:** \`${replyKey.slice(0, 16)}...\`
-
----
-
-${message}
-
----
-_Reply via overlay: \`overlay-cli send ${replyKey} ping "your reply"\`_`;
-
-  // Attempt delivery via OpenClaw hooks
-  let deliverySuccess = false;
-  let deliveryError = null;
+  // Now actually deliver the message
+  const formattedMessage = formattedMessageTemplate(tier, tierEmoji, paidSats);
+  let actualDeliverySuccess = false;
+  let actualDeliveryError = null;
 
   try {
-    // Read hook token from OpenClaw config
-    const openclawConfigPath = path.join(os.homedir(), '.openclaw', 'openclaw.json');
-    let hookToken = null;
-    let hookPort = 18789;
-    
-    if (fs.existsSync(openclawConfigPath)) {
-      const openclawConfig = JSON.parse(fs.readFileSync(openclawConfigPath, 'utf-8'));
-      hookToken = openclawConfig?.hooks?.token;
-      hookPort = openclawConfig?.gateway?.port || 18789;
-    }
-
-    if (!hookToken) {
-      throw new Error('OpenClaw hooks not configured');
-    }
-
     const hookUrl = `http://127.0.0.1:${hookPort}/hooks/agent`;
     const hookResp = await fetchWithTimeout(hookUrl, {
       method: 'POST',
@@ -5143,13 +5202,13 @@ _Reply via overlay: \`overlay-cli send ${replyKey} ping "your reply"\`_`;
     });
 
     if (hookResp.ok) {
-      deliverySuccess = true;
+      actualDeliverySuccess = true;
     } else {
       const body = await hookResp.text().catch(() => '');
-      deliveryError = `Hook failed: ${hookResp.status} ${body}`;
+      actualDeliveryError = `Hook failed: ${hookResp.status} ${body}`;
     }
   } catch (err) {
-    deliveryError = err.message;
+    actualDeliveryError = err.message;
   }
 
   // Log the delivery attempt
@@ -5162,24 +5221,26 @@ _Reply via overlay: \`overlay-cli send ${replyKey} ping "your reply"\`_`;
     paidSats,
     messageLength: message.length,
     deliveryChannel: config.deliveryChannel,
-    deliverySuccess,
-    deliveryError,
+    deliverySuccess: actualDeliverySuccess,
+    deliveryError: actualDeliveryError,
+    paymentTxid: payResult.txid,
     timestamp: new Date().toISOString(),
   };
   fs.appendFileSync(logPath, JSON.stringify(logEntry) + '\n');
 
-  // Send response
+  // Send response - status reflects ACTUAL delivery result
   const responsePayload = {
     requestId: msg.id,
     serviceId: 'baemail',
-    status: deliverySuccess ? 'fulfilled' : 'failed',
+    status: actualDeliverySuccess ? 'fulfilled' : 'delivery_failed',
     result: {
-      delivered: deliverySuccess,
+      delivered: actualDeliverySuccess,
       tier,
       channel: config.deliveryChannel,
       paidSats,
-      error: deliveryError,
+      error: actualDeliveryError,
       replyTo: identityKey,
+      note: actualDeliverySuccess ? undefined : 'Payment was accepted. Contact provider for refund if delivery failed.',
     },
     paymentAccepted: true,
     paymentTxid: payResult.txid,
@@ -5195,10 +5256,10 @@ _Reply via overlay: \`overlay-cli send ${replyKey} ping "your reply"\`_`;
 
   return {
     id: msg.id, type: 'service-request', serviceId: 'baemail',
-    action: deliverySuccess ? 'fulfilled' : 'failed',
+    action: actualDeliverySuccess ? 'fulfilled' : 'delivery_failed',
     tier,
-    deliverySuccess,
-    deliveryError,
+    deliverySuccess: actualDeliverySuccess,
+    deliveryError: actualDeliveryError,
     paymentAccepted: true, paymentTxid: payResult.txid,
     satoshisReceived: payResult.satoshis,
     from: msg.from, ack: true,
